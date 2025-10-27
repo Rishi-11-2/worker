@@ -68,7 +68,8 @@ load_dotenv()
 PAPER_DIR = "./papers"
 
 # --- Download Config ---
-DOWNLOAD_TIMEOUT = 0  # per-request timeout (seconds)
+# *** FIX: Set a reasonable timeout. 0 means wait forever, which can cause hangs. ***
+DOWNLOAD_TIMEOUT = 60  # per-request timeout (seconds)
 
 # --- Qdrant Config (prefer environment overrides) ---
 QDRANT_URL = os.environ.get("QDRANT_URL")
@@ -172,8 +173,11 @@ def download_one(
 ):
     """Downloads a single file."""
     try:
+        # Use a non-zero timeout if specified
+        req_timeout = timeout if timeout > 0 else None
+        
         with session.get(
-            url, stream=True, timeout=timeout, allow_redirects=True
+            url, stream=True, timeout=req_timeout, allow_redirects=True
         ) as resp:
             resp.raise_for_status()
             # --- Determine filename ---
@@ -446,9 +450,11 @@ def ensure_qdrant_collection(
         existing = client.get_collections().collections
         if any(c.name == collection_name for c in existing):
             # Collection already exists, do nothing
+            # print(f"[INFO] Collection '{collection_name}' already exists.") # Optional: for verbose logging
             return
     except Exception:
         # Fallback: try to create anyway
+        print("[WARN] Could not list collections. Will attempt to create.", flush=True)
         pass
 
     # Map distance string to Qdrant's rest.Distance enum
@@ -464,10 +470,22 @@ def ensure_qdrant_collection(
         flush=True
     )
     try:
-        client.recreate_collection(
+        # *** FIX: Use create_collection, NOT recreate_collection. ***
+        # `recreate_collection` DELETES existing data, which is dangerous.
+        # `create_collection` will safely fail if it already exists.
+        client.create_collection(
             collection_name=collection_name,
             vectors_config=rest.VectorParams(size=vector_size, distance=dist),
         )
+        print(f"[INFO] Collection '{collection_name}' created.", flush=True)
+    except ResponseHandlingException as e:
+        # Handle race condition or if the initial check failed
+        e_str = str(e).lower()
+        if "already exists" in e_str or "status_code=409" in e_str:
+            print(f"[INFO] Collection '{collection_name}' already exists.", flush=True)
+        else:
+            print(f"[ERROR] Failed to create collection '{collection_name}': {e}", flush=True)
+            raise # Re-raise other creation errors
     except Exception as e:
         print(f"[ERROR] Failed to create collection '{collection_name}': {e}", flush=True)
         raise
@@ -569,7 +587,11 @@ def run_ingestion(pdf_files: List[str]):
         return
 
     total_points_processed = 0
-    _ = get_existing_ids_in_collection(client, QDRANT_COLLECTION)
+    
+    # *** FIX: Removed this line. It fetches all IDs and does nothing with them. ***
+    # This was likely a remnant of a deduplication step, but as-is it's a
+    # performance drain for no benefit.
+    # _ = get_existing_ids_in_collection(client, QDRANT_COLLECTION)
 
     for pdf_path in pdf_files:
         print(f"\n--- Processing: {pdf_path} ---", flush=True)
@@ -797,7 +819,8 @@ if __name__ == "__main__":
     
     # The simple query you want to run
     USER_QUERY = "Machine learning"
-    
+    print(QDRANT_API_KEY)
+    print(QDRANT_URL)
     # How many papers to fetch from the query
     MAX_PAPERS_TO_FETCH = 5 
     

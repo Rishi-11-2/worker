@@ -1,0 +1,5 @@
+http://arxiv.org/pdf/1909.03550v1 Title : Lecture Notes: Optimization for Machine Learning
+http://arxiv.org/pdf/1811.04422v1 Title : An Optimal Control View of Adversarial Machine Learning
+http://arxiv.org/pdf/1707.04849v1 Title : Minimax deviation strategies for machine learning and recognition with short learning samples
+http://arxiv.org/pdf/1909.09246v1 Title : Machine Learning for Clinical Predictive Analytics
+http://arxiv.org/pdf/2301.09753v1 Title : Towards Modular Machine Learning Solution Development: Benefits and Trade-offs
