@@ -1,4 +1,4 @@
-name: scheduled-worker
+name: scheduled-ingestion
 
 on:
   schedule:
@@ -22,10 +22,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run worker (drain mode)
+      - name: Run ingestion (drain mode)
         env:
           REDIS_URL: ${{ secrets.REDIS_URL }}
           QDRANT_URL: ${{ secrets.QDRANT_URL }}
           QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
         run: |
-          python worker.py
+          python rag_ingestion_service.py
