@@ -31,10 +31,13 @@ from tqdm.auto import tqdm
 from dotenv import load_dotenv
 import tiktoken
 from sentence_transformers import SentenceTransformer
+import ollama
+from litellm import completion
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as rest
 from qdrant_client.http.exceptions import ResponseHandlingException
+from ollama import Client
 import httpx
 
 # --- Core docling tools (ensure these are installed) ---
@@ -75,7 +78,7 @@ DOWNLOAD_TIMEOUT = 60  # per-request timeout (seconds)
 QDRANT_URL = os.environ.get("QDRANT_URL")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
 QDRANT_COLLECTION =  "document_chunks"
-
+OPEN_ROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 # --- Embedding Model Config ---
 EMBEDDING_MODEL_NAME = 'sentence-transformers/paraphrase-MiniLM-L3-v2'
 EMBEDDING_DEVICE = "cpu"  # "cuda" if available
@@ -770,6 +773,8 @@ def search_and_run_pipeline(query: str, max_results: int = 10):
         query: The search term (e.g., "Machine learning").
         max_results: The maximum number of papers to fetch.
     """
+
+    query = model_query(query)
     print(f"[INFO] Starting arXiv search for query: '{query}'", flush=True)
     
     try:
@@ -777,7 +782,7 @@ def search_and_run_pipeline(query: str, max_results: int = 10):
         search = arxiv.Search(
             query=query,
             max_results=max_results,
-            sort_by=arxiv.SortCriterion.Relevance
+            sort_by=arxiv.SortCriterion.SubmittedDate,
         )
         
         results = list(search.results())
@@ -812,19 +817,33 @@ def search_and_run_pipeline(query: str, max_results: int = 10):
         print(f"[ERROR] An error occurred during the arXiv search: {e}", flush=True)
 
 
+def model_query(query:str)->str:
+    
+    messages = [
+    {"role": "system", "content": f"you are a smart research assistant based on the query list out 3-4 relevant topics"},
+    {"role": "user", "content": f"based on this query:{query} ,  only list out several topics that are relevant to the query each topic should be of one word ONLY"}
+    ]
+    resp = completion(
+        model="openrouter/z-ai/glm-4.5-air:free",
+        messages=messages,
+    )
+    return resp.choices[0].message.content
+
+
 # --- Script Entry Point ---
 if __name__ == "__main__":
     
     # --- CONFIGURE YOUR SEARCH QUERY HERE ---
     
     # The simple query you want to run
-    USER_QUERY = "Machine learning"
-    print(QDRANT_API_KEY)
-    print(QDRANT_URL)
+    USER_QUERY = "Machine learning ,Deep Learning, Reinforecement Learning , Meta Learning,LLMs"
+    # print(QDRANT_API_KEY)
+    # print(QDRANT_URL)
     # How many papers to fetch from the query
     MAX_PAPERS_TO_FETCH = 5 
+
+    # print(model_query(USER_QUERY))
     
-    # This is the new main function call
     search_and_run_pipeline(
         query=USER_QUERY,
         max_results=MAX_PAPERS_TO_FETCH

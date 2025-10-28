@@ -7,3 +7,8 @@ sentence-transformers
 tiktoken
 arxiv
 docling
+ollama
+litellm
+pandas
+pydantic
+aiohttp
