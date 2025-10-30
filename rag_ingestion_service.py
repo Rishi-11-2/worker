@@ -764,7 +764,7 @@ def run_pipeline(input_file_path: str):
 # -----------------------------------------------------------------
 # NEW: Function to search arXiv and then run the pipeline
 # -----------------------------------------------------------------
-def search_and_run_pipeline(query: str, max_results: int = 10):
+def search_and_run_pipeline(query: str, max_results: int = 2):
     """
     Searches arXiv for a query, saves results to a temp file,
     and then runs the full download/ingest pipeline.
@@ -783,6 +783,7 @@ def search_and_run_pipeline(query: str, max_results: int = 10):
             query=query,
             max_results=max_results,
             sort_by=arxiv.SortCriterion.SubmittedDate,
+            sort_order=arxiv.SortOrder.Descending,
         )
         
         results = list(search.results())
@@ -819,13 +820,22 @@ def search_and_run_pipeline(query: str, max_results: int = 10):
 
 def model_query(query:str)->str:
     
-    messages = [
-    {"role": "system", "content": f"you are a smart research assistant based on the query list out 3-4 relevant topics"},
-    {"role": "user", "content": f"based on this query:{query} ,  only list out several topics that are relevant to the query each topic should be of one word ONLY"}
-    ]
+    prompt = f"""
+    You are an assistant that converts topic keywords into arXiv category codes.
+
+    Input: a comma-separated list of topic keywords.
+    Output: EXACTLY one line containing 5-10 arXiv category codes separated by commas (example: cs.AI, cs.LG, stat.ML).
+    Do NOT output JSON, bullet lists, explanation, or any other text—only the comma-separated categories.
+    If unsure, choose general categories like cs.LG, cs.AI, cs.CV, stat.ML.
+
+    Topics: {query}
+    """.strip()
+    
     resp = completion(
-        model="openrouter/z-ai/glm-4.5-air:free",
-        messages=messages,
+        model="openrouter/minimax/minimax-m2:free",
+        messages=[{"role":"system","content":"You are a concise conversion assistant."},
+                  {"role":"user","content":prompt}],
+        temperature=0
     )
     return resp.choices[0].message.content
 

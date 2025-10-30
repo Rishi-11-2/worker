@@ -27,5 +27,6 @@ jobs:
           REDIS_URL: ${{ secrets.REDIS_URL }}
           QDRANT_URL: ${{ secrets.QDRANT_URL }}
           QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
+          OPENROUTER_API_KEY : ${{secrets.OPENROUTER_API_KEY}}
         run: |
           python rag_ingestion_service.py

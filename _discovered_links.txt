@@ -1,5 +1,5 @@
-http://arxiv.org/pdf/2510.23607v1 Title : Concerto: Joint 2D-3D Self-Supervised Learning Emerges Spatial Representations
-http://arxiv.org/pdf/2510.23606v1 Title : Variational Masked Diffusion Models
-http://arxiv.org/pdf/2510.23605v1 Title : Track, Inpaint, Resplat: Subject-driven 3D and 4D Generation with Progressive Texture Infilling
-http://arxiv.org/pdf/2510.23603v1 Title : PixelRefer: A Unified Framework for Spatio-Temporal Object Referring with Arbitrary Granularity
-http://arxiv.org/pdf/2510.23601v1 Title : Alita-G: Self-Evolving Generative Agent for Agent Generation
+http://arxiv.org/pdf/2510.25772v1 Title : VFXMaster: Unlocking Dynamic Visual Effect Generation via In-Context Learning
+http://arxiv.org/pdf/2510.25771v1 Title : Gaperon: A Peppered English-French Generative Language Model Suite
+http://arxiv.org/pdf/2510.25770v1 Title : E-Scores for (In)Correctness Assessment of Generative Model Outputs
+http://arxiv.org/pdf/2510.25769v1 Title : Neural Stochastic Flows: Solver-Free Modelling and Inference for SDE Solutions
+http://arxiv.org/pdf/2510.25766v1 Title : Decomposition-Enhanced Training for Post-Hoc Attributions In Language Models

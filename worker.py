@@ -64,6 +64,7 @@ try:
         TokenizerWrapper,
         QDRANT_URL,
         QDRANT_API_KEY,
+        OPEN_ROUTER_API_KEY,
         EMBEDDING_MODEL_NAME,
         EMBEDDING_DEVICE,
         TOKENIZER_NAME
