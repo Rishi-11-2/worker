@@ -840,6 +840,8 @@ def model_query(query:str)->str:
     return resp.choices[0].message.content
 
 
+
+
 # --- Script Entry Point ---
 if __name__ == "__main__":
     
