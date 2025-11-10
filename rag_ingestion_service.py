@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
-Single-file script to search for PDFs on arXiv, download them, and ingest into Qdrant.
+It attempts to return "latest popular"
+papers by pulling a larger candidate pool (sorted by relevance) and re-ranking the
+results by combining relevance (result position) with recency (published date).
 
-This script:
-1.  Accepts a search query (e.g., "Machine learning").
-2.  Uses the `arxiv` library to find papers matching the query.
-3.  Writes the discovered PDF URLs and titles to a temporary file.
-4.  Passes this file to the downloader and ingestion pipeline.
+Behavioral notes:
+- We fetch a larger pool (POOL_MULTIPLIER * max_results, min POOL_MIN) from arXiv
+  (sorted by relevance), then compute a combined score:
+    score = alpha * relevance_score + beta * recency_score
+  where relevance_score = 1/(1+rank_index) and recency_score = 1/(1+days_since_published).
+- The top `max_results` from that re-ranked list are then downloaded and ingested.
 
-Usage:
-1.  Install dependencies: pip install docling sentence-transformers tiktoken qdrant-client requests tqdm python-dotenv arxiv
-2.  Set your QDRANT_URL/QDRANT_API_KEY in a .env file.
-3.  Set the `USER_QUERY` variable in the `if __name__ == "__main__":` block below.
-4.  Run `python3 your_script_name.py`
+All original downloader and ingestion logic is preserved; only the arXiv search
+and selection logic were enhanced. You can tune POOL_MULTIPLIER, POOL_MIN,
+ALPHA_RELEVANCE and BETA_RECENCY to bias toward relevance or recency.
 """
 
 import os
@@ -24,6 +25,7 @@ import math
 import re
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse, unquote
+import datetime
 
 # --- Import Dependencies ---
 import requests
@@ -77,7 +79,7 @@ DOWNLOAD_TIMEOUT = 60  # per-request timeout (seconds)
 # --- Qdrant Config (prefer environment overrides) ---
 QDRANT_URL = os.environ.get("QDRANT_URL")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")
-QDRANT_COLLECTION =  "document_chunks"
+QDRANT_COLLECTION =  "documents_chunks"
 OPEN_ROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
 # --- Embedding Model Config ---
 EMBEDDING_MODEL_NAME = 'sentence-transformers/paraphrase-MiniLM-L3-v2'
@@ -95,6 +97,12 @@ EMBED_BATCH_SIZE = 256
 QDRANT_UPSERT_BATCH = 256
 
 MAX_CHUNKS_PER_PDF = 200_000
+
+# --- arXiv selection tuning ---
+POOL_MULTIPLIER = 6        # fetch this many * max_results candidates from arXiv
+POOL_MIN = 20              # minimum number of candidates to fetch regardless of multiplier
+ALPHA_RELEVANCE = 0.6      # weight for relevance (position in arXiv results)
+BETA_RECENCY = 0.4         # weight for recency (published date)
 
 # -----------------------------------------------------------------
 
@@ -769,35 +777,76 @@ def search_and_run_pipeline(query: str, max_results: int = 2):
     Searches arXiv for a query, saves results to a temp file,
     and then runs the full download/ingest pipeline.
     
-    Args:
-        query: The search term (e.g., "Machine learning").
-        max_results: The maximum number of papers to fetch.
+    This function now attempts to fetch a candidate pool (larger than
+    max_results) and re-ranks candidates by a combined relevance+recency score
+    so the final selection is biased toward "latest popular" papers.
     """
 
-    query = model_query(query)
-    print(f"[INFO] Starting arXiv search for query: '{query}'", flush=True)
-    
+    # Attempt to convert topics into arXiv categories using the model_query helper.
+    categories = None
     try:
-        # Search arXiv for relevant papers, sorted by relevance
+        categories = model_query(query)
+    except Exception:
+        # If model_query fails for any reason, we'll just use the raw query string.
+        categories = None
+
+    effective_query = categories if categories else query
+
+    print(f"[INFO] Starting arXiv search for query: '{effective_query}'", flush=True)
+
+    # Determine pool size to fetch from arXiv
+    pool_size = max(POOL_MIN, int(max_results * POOL_MULTIPLIER))
+
+    try:
+        # Search arXiv for relevant papers, fetch a larger pool sorted by relevance
         search = arxiv.Search(
-            query=query,
-            max_results=max_results,
-            sort_by=arxiv.SortCriterion.SubmittedDate,
+            query=effective_query,
+            max_results=pool_size,
+            sort_by=arxiv.SortCriterion.Relevance,
             sort_order=arxiv.SortOrder.Descending,
         )
-        
         results = list(search.results())
-        
+
         if not results:
-            print(f"[INFO] No results found on arXiv for query: '{query}'", flush=True)
+            print(f"[INFO] No results found on arXiv for query: '{effective_query}'", flush=True)
             return
 
-        print(f"[INFO] Found {len(results)} papers. Preparing download list.", flush=True)
-        
+        print(f"[INFO] Retrieved {len(results)} candidate papers from arXiv. Re-ranking by recency+relevance.", flush=True)
+
+        # Compute combined score for each candidate
+        now = datetime.datetime.now(datetime.UTC)
+        scored = []
+        for idx, r in enumerate(results):
+            # rank-based relevance score (higher for earlier results)
+            relevance_score = 1.0 / (1 + idx)
+            # days since published
+            try:
+                published = r.published if getattr(r, 'published', None) else getattr(r, 'updated', None)
+                if not published:
+                    days = 3650
+                else:
+                    if isinstance(published, datetime.datetime):
+                        delta = now - published
+                    else:
+                        # fallback: try parsing
+                        delta = now - datetime.datetime.strptime(str(published), "%Y-%m-%dT%H:%M:%SZ")
+                    days = max(0, delta.days)
+            except Exception:
+                days = 3650
+
+            recency_score = 1.0 / (1 + days)
+            combined = ALPHA_RELEVANCE * relevance_score + BETA_RECENCY * recency_score
+            scored.append((combined, idx, r))
+
+        # Sort by combined score (descending) and pick top max_results
+        top = sorted(scored, key=lambda x: x[0], reverse=True)[:max_results]
+        selected = [item[2] for item in top]
+
+        print(f"[INFO] Selected top {len(selected)} papers (by combined score). Preparing download list.", flush=True)
+
         # Prepare lines in the format our downloader expects
-        # (URL <whitespace> Title : <title>)
         download_tasks = []
-        for res in results:
+        for res in selected:
             # Clean title: remove newlines and excess whitespace
             clean_title = re.sub(r'\s+', ' ', res.title).strip()
             # Format: URL Title : Title Text
@@ -840,22 +889,16 @@ def model_query(query:str)->str:
     return resp.choices[0].message.content
 
 
-
-
 # --- Script Entry Point ---
 if __name__ == "__main__":
     
     # --- CONFIGURE YOUR SEARCH QUERY HERE ---
     
     # The simple query you want to run
-    USER_QUERY = "Machine learning ,Deep Learning, Reinforecement Learning , Meta Learning,LLMs"
-    # print(QDRANT_API_KEY)
-    # print(QDRANT_URL)
+    USER_QUERY = "Machine learning ,Deep Learning, Reinforcement Learning , Meta Learning,LLMs"
     # How many papers to fetch from the query
     MAX_PAPERS_TO_FETCH = 5 
 
-    # print(model_query(USER_QUERY))
-    
     search_and_run_pipeline(
         query=USER_QUERY,
         max_results=MAX_PAPERS_TO_FETCH

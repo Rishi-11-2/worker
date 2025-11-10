@@ -1,5 +1,5 @@
-http://arxiv.org/pdf/2510.25772v1 Title : VFXMaster: Unlocking Dynamic Visual Effect Generation via In-Context Learning
-http://arxiv.org/pdf/2510.25771v1 Title : Gaperon: A Peppered English-French Generative Language Model Suite
-http://arxiv.org/pdf/2510.25770v1 Title : E-Scores for (In)Correctness Assessment of Generative Model Outputs
-http://arxiv.org/pdf/2510.25769v1 Title : Neural Stochastic Flows: Solver-Free Modelling and Inference for SDE Solutions
-http://arxiv.org/pdf/2510.25766v1 Title : Decomposition-Enhanced Training for Post-Hoc Attributions In Language Models
+http://arxiv.org/pdf/1712.00725v1 Title : Sentiment Classification using Images and Label Embeddings
+http://arxiv.org/pdf/2509.21473v1 Title : Are Hallucinations Bad Estimations?
+http://arxiv.org/pdf/1806.03497v1 Title : Generalized Earley Parser: Bridging Symbolic Grammars and Sequence Data for Future Prediction
+http://arxiv.org/pdf/2108.03857v2 Title : GAN Computers Generate Arts? A Survey on Visual Arts, Music, and Literary Text Generation using Generative Adversarial Network
+http://arxiv.org/pdf/2002.01464v1 Title : Visual Concept-Metaconcept Learning
