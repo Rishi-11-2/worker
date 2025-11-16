@@ -2,7 +2,7 @@ name: scheduled-ingestion
 
 on:
   schedule:
-    - cron: '0 0 * * 0'   # every 5 minutes
+    - cron: '0 0 * * 0'   # every week
   workflow_dispatch: {}     # allow manual runs
 
 jobs:
