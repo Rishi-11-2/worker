@@ -554,6 +554,36 @@ def get_existing_ids_in_collection(client: QdrantClient, collection_name: str, l
     return ids
 
 
+
+def is_file_ingested(client: QdrantClient, collection_name: str, filename: str) -> bool:
+    """
+    Checks if a file has already been ingested by looking for any point
+    with 'source' matching the filename.
+    """
+    try:
+        # Filter for points where 'source' == filename
+        # We only need to find 1 to know it's there.
+        scroll_filter = rest.Filter(
+            must=[
+                rest.FieldCondition(
+                    key="source",
+                    match=rest.MatchValue(value=filename)
+                )
+            ]
+        )
+        points, _ = client.scroll(
+            collection_name=collection_name,
+            scroll_filter=scroll_filter,
+            limit=1,
+            with_payload=False,
+            with_vectors=False
+        )
+        return bool(points)
+    except Exception as e:
+        print(f"[WARN] Failed to check if file is ingested: {e}", flush=True)
+        return False
+
+
 # ---------- Main ingestion logic ----------
 def run_ingestion(pdf_files: List[str]):
     """
@@ -599,12 +629,20 @@ def run_ingestion(pdf_files: List[str]):
 
     total_points_processed = 0
     
-    # *** FIX: Removed this line. It fetches all IDs and does nothing with them. ***
-    # This was likely a remnant of a deduplication step, but as-is it's a
-    # performance drain for no benefit.
-    # _ = get_existing_ids_in_collection(client, QDRANT_COLLECTION)
+    # Ensure collection exists before we try to check against it
+    # (Though usually we check inside the loop, checking existence once is fine)
+    # We'll rely on ensure_qdrant_collection called later or just assume it might exist.
+    # If it doesn't exist, is_file_ingested will likely just return False or error (caught).
 
     for pdf_path in pdf_files:
+        filename = os.path.basename(pdf_path)
+        
+        # --- DEDUPLICATION CHECK ---
+        if is_file_ingested(client, QDRANT_COLLECTION, filename):
+            print(f"[INFO] File '{filename}' already ingested. Skipping.", flush=True)
+            continue
+        # ---------------------------
+
         print(f"\n--- Processing: {pdf_path} ---", flush=True)
         file_t0 = time.time()
         try:
@@ -865,6 +903,53 @@ def search_and_run_pipeline(query: str, max_results: int = 2):
 
     except Exception as e:
         print(f"[ERROR] An error occurred during the arXiv search: {e}", flush=True)
+
+
+
+def process_direct_arxiv_request(query: str) -> Optional[str]:
+    """
+    Checks if the query is a direct arXiv ID or URL.
+    If so, downloads and ingests it directly.
+    Returns a success message if handled, otherwise None.
+    """
+    # Regex for arXiv ID (e.g., 2310.12345 or 2310.12345v1)
+    # Also matches full URLs like https://arxiv.org/abs/2310.12345
+    arxiv_id_pattern = r'(?:arxiv\.org\/(?:abs|pdf)\/)?(\d{4}\.\d{4,5}(?:v\d+)?)'
+    
+    match = re.search(arxiv_id_pattern, query.strip())
+    if not match:
+        return None
+
+    arxiv_id = match.group(1)
+    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+    print(f"[INFO] Detected direct arXiv ID: {arxiv_id}. Downloading from {pdf_url}", flush=True)
+
+    try:
+        # Create a session for download
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) CustomDownloader/1.0",
+            "Accept": "application/pdf,application/octet-stream,*/*;q=0.9",
+        })
+
+        # Download
+        # We don't have a title easily available without querying API, so we'll let it fallback to ID
+        res = download_one(session, pdf_url, None, PAPER_DIR, DOWNLOAD_TIMEOUT)
+        
+        if not res.get("ok"):
+            return f"Failed to download arXiv ID {arxiv_id}: {res.get('error')}"
+
+        file_path = res["path"]
+        print(f"[INFO] Successfully downloaded to {file_path}", flush=True)
+
+        # Ingest
+        run_ingestion([file_path])
+        
+        return f"Successfully ingested arXiv paper: {arxiv_id} ({os.path.basename(file_path)})"
+
+    except Exception as e:
+        print(f"[ERROR] Error processing direct arXiv request {arxiv_id}: {e}", flush=True)
+        return f"Error processing arXiv ID {arxiv_id}: {str(e)}"
 
 
 def model_query(query:str)->str:
