@@ -810,90 +810,155 @@ def run_pipeline(input_file_path: str):
 # -----------------------------------------------------------------
 # NEW: Function to search arXiv and then run the pipeline
 # -----------------------------------------------------------------
+# -----------------------------------------------------------------
+# NEW: Function to search arXiv and then run the pipeline
+# -----------------------------------------------------------------
 def search_and_run_pipeline(query: str, max_results: int = 2):
     """
     Searches arXiv for a query, saves results to a temp file,
     and then runs the full download/ingest pipeline.
     
-    This function now attempts to fetch a candidate pool (larger than
-    max_results) and re-ranks candidates by a combined relevance+recency score
-    so the final selection is biased toward "latest popular" papers.
+    Logic:
+    1. First, tries to treat the query as a SPECIFIC TITLE.
+       - Uses `ti:"query"` syntax.
+       - If a match is found with high similarity, it is selected immediately.
+    2. If no specific title match, treats it as a TOPIC/KEYWORD search.
+       - Uses `model_query` to get categories if possible.
+       - Fetches a large pool of candidates.
+       - Re-ranks them heavily favoring RECENCY (new papers).
     """
 
-    # Attempt to convert topics into arXiv categories using the model_query helper.
-    categories = None
-    try:
-        categories = model_query(query)
-    except Exception:
-        # If model_query fails for any reason, we'll just use the raw query string.
-        categories = None
+    print(f"[INFO] Processing query: '{query}'", flush=True)
 
-    effective_query = categories if categories else query
+    # --- Tuning Parameters for Topic Search ---
+    # We want "recent and new" papers for topics.
+    TOPIC_POOL_MULTIPLIER = 10     # Fetch more candidates to find recent ones
+    TOPIC_ALPHA_RELEVANCE = 0.3    # Lower weight for relevance (search rank)
+    TOPIC_BETA_RECENCY = 0.7       # Higher weight for recency
+    
+    # Check if query looks like a list of topics (comma separated) or asks for "latest"
+    is_topic_list = "," in query or "latest" in query.lower() or "recent" in query.lower() or "new" in query.lower()
+    
+    candidates = []
+    search_mode = "unknown"
 
-    print(f"[INFO] Starting arXiv search for query: '{effective_query}'", flush=True)
-
-    # Determine pool size to fetch from arXiv
-    pool_size = max(POOL_MIN, int(max_results * POOL_MULTIPLIER))
-
-    try:
-        # Search arXiv for relevant papers, fetch a larger pool sorted by relevance
-        search = arxiv.Search(
-            query=effective_query,
-            max_results=pool_size,
-            sort_by=arxiv.SortCriterion.Relevance,
-            sort_order=arxiv.SortOrder.Descending,
-        )
-        results = list(search.results())
-
-        # --- Fallback: If no results and query was modified (or contains special chars), try raw/cleaned query ---
-        if not results:
-            print(f"[INFO] No results found for '{effective_query}'. Trying fallback strategies...", flush=True)
+    # ---------------------------------------------------------
+    # PATH A: Specific Title Search (Priority)
+    # ---------------------------------------------------------
+    if not is_topic_list:
+        print(f"[INFO] Attempting Specific Title Search for: '{query}'", flush=True)
+        try:
+            # 1. Try exact title search
+            search = arxiv.Search(
+                query=f'ti:"{query}"',
+                max_results=5,
+                sort_by=arxiv.SortCriterion.Relevance,
+                sort_order=arxiv.SortOrder.Descending,
+            )
+            results = list(search.results())
             
-            # Strategy 1: If we used categories, try the original query
-            if effective_query != query:
-                print(f"[INFO] Fallback 1: Trying original query '{query}'", flush=True)
-                search = arxiv.Search(query=query, max_results=pool_size, sort_by=arxiv.SortCriterion.Relevance, sort_order=arxiv.SortOrder.Descending)
-                results = list(search.results())
+            if results:
+                # Check if the top result is a good match
+                top_res = results[0]
+                # Simple normalization for comparison
+                q_norm = re.sub(r'\W+', '', query.lower())
+                t_norm = re.sub(r'\W+', '', top_res.title.lower())
+                
+                # If the title is contained in the query or vice versa, or very similar
+                if q_norm in t_norm or t_norm in q_norm:
+                    print(f"[INFO] Found exact/high-confidence title match: '{top_res.title}'", flush=True)
+                    candidates = [top_res]
+                    search_mode = "title_match"
+            
+            # 2. If no title match, try raw query search but look for exact matches
+            if not candidates:
+                 search = arxiv.Search(
+                    query=query,
+                    max_results=5,
+                    sort_by=arxiv.SortCriterion.Relevance,
+                    sort_order=arxiv.SortOrder.Descending,
+                )
+                 results = list(search.results())
+                 for res in results:
+                    q_norm = re.sub(r'\W+', '', query.lower())
+                    t_norm = re.sub(r'\W+', '', res.title.lower())
+                    if q_norm == t_norm:
+                         print(f"[INFO] Found exact title match in raw search: '{res.title}'", flush=True)
+                         candidates = [res]
+                         search_mode = "title_match"
+                         break
+        except Exception as e:
+            print(f"[WARN] Title search failed: {e}", flush=True)
 
-            # Strategy 2: If still no results, try cleaning the query (remove special chars)
-            if not results:
-                clean_query = re.sub(r'[^\w\s]', '', query).strip()
-                if clean_query != query and clean_query:
-                    print(f"[INFO] Fallback 2: Trying cleaned query '{clean_query}'", flush=True)
-                    search = arxiv.Search(query=clean_query, max_results=pool_size, sort_by=arxiv.SortCriterion.Relevance, sort_order=arxiv.SortOrder.Descending)
-                    results = list(search.results())
+    # ---------------------------------------------------------
+    # PATH B: Topic / Category Search (Fallback or Explicit)
+    # ---------------------------------------------------------
+    if not candidates:
+        print(f"[INFO] Proceeding with Topic/Category Search for: '{query}'", flush=True)
+        search_mode = "topic"
+        
+        # Attempt to convert topics into arXiv categories
+        categories = None
+        try:
+            categories = model_query(query)
+        except Exception:
+            categories = None
 
-            # Strategy 3: Try searching as a title specifically
-            if not results:
-                print(f"[INFO] Fallback 3: Trying title search for '{query}'", flush=True)
-                # arxiv supports ti:title
-                title_query = f'ti:"{query}"'
-                search = arxiv.Search(query=title_query, max_results=pool_size, sort_by=arxiv.SortCriterion.Relevance, sort_order=arxiv.SortOrder.Descending)
-                results = list(search.results())
+        effective_query = categories if categories else query
+        print(f"[INFO] Using effective query: '{effective_query}'", flush=True)
 
-            # Strategy 4: Split into keywords and search with OR (broad search)
-            if not results:
-                keywords = query.split()
-                if len(keywords) > 1:
-                    or_query = " OR ".join(keywords)
-                    print(f"[INFO] Fallback 4: Trying broad keyword search '{or_query}'", flush=True)
-                    search = arxiv.Search(query=or_query, max_results=pool_size, sort_by=arxiv.SortCriterion.Relevance, sort_order=arxiv.SortOrder.Descending)
-                    results = list(search.results())
+        pool_size = max(POOL_MIN, int(max_results * TOPIC_POOL_MULTIPLIER))
+        
+        try:
+            # For "latest" papers, we might want to sort by SubmittedDate, but Relevance 
+            # with our re-ranking is often safer to ensure we stay on topic.
+            # We will stick to Relevance for the fetch, but re-rank heavily for recency.
+            search = arxiv.Search(
+                query=effective_query,
+                max_results=pool_size,
+                sort_by=arxiv.SortCriterion.Relevance,
+                sort_order=arxiv.SortOrder.Descending,
+            )
+            results = list(search.results())
+            
+            if not results and effective_query != query:
+                 print(f"[INFO] No results for categories. Retrying with raw query.", flush=True)
+                 search = arxiv.Search(
+                    query=query,
+                    max_results=pool_size,
+                    sort_by=arxiv.SortCriterion.Relevance,
+                    sort_order=arxiv.SortOrder.Descending,
+                )
+                 results = list(search.results())
 
-        if not results:
-            msg = f"No results found on arXiv for query: '{query}' (and fallbacks)"
-            print(f"[INFO] {msg}", flush=True)
-            return msg
+            candidates = results
+            
+        except Exception as e:
+            print(f"[ERROR] Topic search failed: {e}", flush=True)
+            return f"Error during topic search: {e}"
 
-        print(f"[INFO] Retrieved {len(results)} candidate papers from arXiv. Re-ranking by recency+relevance.", flush=True)
+    if not candidates:
+        msg = f"No results found on arXiv for query: '{query}'"
+        print(f"[INFO] {msg}", flush=True)
+        return msg
 
-        # Compute combined score for each candidate
+    # ---------------------------------------------------------
+    # Selection & Re-ranking
+    # ---------------------------------------------------------
+    selected = []
+    if search_mode == "title_match":
+        # If we matched a title, just take the top 1 (or however many matched)
+        selected = candidates[:1] 
+    else:
+        # Topic mode: Re-rank by Recency + Relevance
+        print(f"[INFO] Re-ranking {len(candidates)} candidates by Recency (beta={TOPIC_BETA_RECENCY})", flush=True)
         now = datetime.datetime.now(datetime.UTC)
         scored = []
-        for idx, r in enumerate(results):
-            # rank-based relevance score (higher for earlier results)
+        for idx, r in enumerate(candidates):
+            # Relevance: 1.0 for top result, decaying
             relevance_score = 1.0 / (1 + idx)
-            # days since published
+            
+            # Recency: Days since published
             try:
                 published = r.published if getattr(r, 'published', None) else getattr(r, 'updated', None)
                 if not published:
@@ -902,94 +967,115 @@ def search_and_run_pipeline(query: str, max_results: int = 2):
                     if isinstance(published, datetime.datetime):
                         delta = now - published
                     else:
-                        # fallback: try parsing
                         delta = now - datetime.datetime.strptime(str(published), "%Y-%m-%dT%H:%M:%SZ")
                     days = max(0, delta.days)
             except Exception:
                 days = 3650
 
+            # Recency score: 1.0 for today, decaying
             recency_score = 1.0 / (1 + days)
-            combined = ALPHA_RELEVANCE * relevance_score + BETA_RECENCY * recency_score
-            scored.append((combined, idx, r))
-
-        # Sort by combined score (descending) and pick top max_results
-        top = sorted(scored, key=lambda x: x[0], reverse=True)[:max_results]
-        selected = [item[2] for item in top]
-
-        print(f"[INFO] Selected top {len(selected)} papers (by combined score). Preparing download list.", flush=True)
-
-        # Prepare lines in the format our downloader expects
-        download_tasks = []
-        for res in selected:
-            # Clean title: remove newlines and excess whitespace
-            clean_title = re.sub(r'\s+', ' ', res.title).strip()
-            # Format: URL Title : Title Text
-            line = f"{res.pdf_url} Title : {clean_title}"
-            download_tasks.append(line)
-
-        # Write the discovered URLs to a temporary file
-        temp_file_path = "_discovered_links.txt"
-        with open(temp_file_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(download_tasks))
             
-        print(f"[INFO] Wrote {len(download_tasks)} URLs to {temp_file_path}", flush=True)
+            # Combined score
+            combined = TOPIC_ALPHA_RELEVANCE * relevance_score + TOPIC_BETA_RECENCY * recency_score
+            scored.append((combined, r))
+
+        # Sort by combined score descending
+        top = sorted(scored, key=lambda x: x[0], reverse=True)[:max_results]
+        selected = [item[1] for item in top]
+
+    print(f"[INFO] Selected top {len(selected)} papers. Preparing download list.", flush=True)
+
+    # Prepare lines in the format our downloader expects
+    download_tasks = []
+    for res in selected:
+        clean_title = re.sub(r'\s+', ' ', res.title).strip()
+        line = f"{res.pdf_url} Title : {clean_title}"
+        download_tasks.append(line)
+
+    # Write the discovered URLs to a temporary file
+    temp_file_path = "_discovered_links.txt"
+    with open(temp_file_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(download_tasks))
         
-        # Now, call the original pipeline using this new file
-        run_pipeline(input_file_path=temp_file_path)
-        
-        return f"Successfully ingested {len(download_tasks)} papers for query: '{query}'"
-
-    except Exception as e:
-        err_msg = f"An error occurred during the arXiv search: {e}"
-        print(f"[ERROR] {err_msg}", flush=True)
-        return err_msg
+    print(f"[INFO] Wrote {len(download_tasks)} URLs to {temp_file_path}", flush=True)
+    
+    # Now, call the original pipeline using this new file
+    run_pipeline(input_file_path=temp_file_path)
+    
+    return f"Successfully ingested {len(download_tasks)} papers for query: '{query}'"
 
 
 
-def process_direct_arxiv_request(query: str) -> Optional[str]:
+def process_direct_input(query: str) -> Optional[str]:
     """
-    Checks if the query is a direct arXiv ID or URL.
+    Checks if the query is a direct URL (http/https) or an arXiv ID.
     If so, downloads and ingests it directly.
     Returns a success message if handled, otherwise None.
     """
-    # Regex for arXiv ID (e.g., 2310.12345 or 2310.12345v1)
-    # Also matches full URLs like https://arxiv.org/abs/2310.12345
-    arxiv_id_pattern = r'(?:arxiv\.org\/(?:abs|pdf)\/)?(\d{4}\.\d{4,5}(?:v\d+)?)'
+    query = query.strip()
     
-    match = re.search(arxiv_id_pattern, query.strip())
-    if not match:
-        return None
-
-    arxiv_id = match.group(1)
-    pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
-    print(f"[INFO] Detected direct arXiv ID: {arxiv_id}. Downloading from {pdf_url}", flush=True)
-
-    try:
-        # Create a session for download
-        session = requests.Session()
-        session.headers.update({
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) CustomDownloader/1.0",
-            "Accept": "application/pdf,application/octet-stream,*/*;q=0.9",
-        })
-
-        # Download
-        # We don't have a title easily available without querying API, so we'll let it fallback to ID
-        res = download_one(session, pdf_url, None, PAPER_DIR, DOWNLOAD_TIMEOUT)
+    # 1. Check for generic URL
+    # Simple regex for http/https URL
+    url_pattern = r'^https?://\S+$'
+    if re.match(url_pattern, query):
+        print(f"[INFO] Detected direct URL: {query}", flush=True)
+        target_url = query
+        # For generic URLs, we might not have a title, so we pass None
+        # download_one handles filename generation from URL
         
-        if not res.get("ok"):
-            return f"Failed to download arXiv ID {arxiv_id}: {res.get('error')}"
+        try:
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) CustomDownloader/1.0",
+                "Accept": "application/pdf,application/octet-stream,*/*;q=0.9",
+            })
+            
+            res = download_one(session, target_url, None, PAPER_DIR, DOWNLOAD_TIMEOUT)
+            if not res.get("ok"):
+                 return f"Failed to download URL {target_url}: {res.get('error')}"
+            
+            file_path = res["path"]
+            print(f"[INFO] Successfully downloaded to {file_path}", flush=True)
+            run_ingestion([file_path])
+            return f"Successfully ingested URL: {target_url} ({os.path.basename(file_path)})"
+        except Exception as e:
+            print(f"[ERROR] Error processing direct URL {target_url}: {e}", flush=True)
+            return f"Error processing URL {target_url}: {str(e)}"
 
-        file_path = res["path"]
-        print(f"[INFO] Successfully downloaded to {file_path}", flush=True)
+    # 2. Check for arXiv ID (fallback if not a full URL)
+    # Regex for arXiv ID (e.g., 2310.12345 or 2310.12345v1)
+    arxiv_id_pattern = r'^(?:arxiv\.org\/(?:abs|pdf)\/)?(\d{4}\.\d{4,5}(?:v\d+)?)$'
+    
+    match = re.search(arxiv_id_pattern, query)
+    if match:
+        arxiv_id = match.group(1)
+        pdf_url = f"https://arxiv.org/pdf/{arxiv_id}.pdf"
+        print(f"[INFO] Detected direct arXiv ID: {arxiv_id}. Downloading from {pdf_url}", flush=True)
 
-        # Ingest
-        run_ingestion([file_path])
-        
-        return f"Successfully ingested arXiv paper: {arxiv_id} ({os.path.basename(file_path)})"
+        try:
+            session = requests.Session()
+            session.headers.update({
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) CustomDownloader/1.0",
+                "Accept": "application/pdf,application/octet-stream,*/*;q=0.9",
+            })
 
-    except Exception as e:
-        print(f"[ERROR] Error processing direct arXiv request {arxiv_id}: {e}", flush=True)
-        return f"Error processing arXiv ID {arxiv_id}: {str(e)}"
+            res = download_one(session, pdf_url, None, PAPER_DIR, DOWNLOAD_TIMEOUT)
+            
+            if not res.get("ok"):
+                return f"Failed to download arXiv ID {arxiv_id}: {res.get('error')}"
+
+            file_path = res["path"]
+            print(f"[INFO] Successfully downloaded to {file_path}", flush=True)
+
+            run_ingestion([file_path])
+            
+            return f"Successfully ingested arXiv paper: {arxiv_id} ({os.path.basename(file_path)})"
+
+        except Exception as e:
+            print(f"[ERROR] Error processing direct arXiv request {arxiv_id}: {e}", flush=True)
+            return f"Error processing arXiv ID {arxiv_id}: {str(e)}"
+
+    return None
 
 
 def model_query(query:str)->str:

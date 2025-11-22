@@ -60,7 +60,7 @@ try:
     # Import your ingestion function and the classes/constants needed to initialize
     from rag_ingestion_service import (
         search_and_run_pipeline,
-        process_direct_arxiv_request,
+        process_direct_input,
         EmbeddingGenerator,
         TokenizerWrapper,
         QDRANT_URL,
@@ -103,32 +103,18 @@ def _process_payload(payload: str, client, emb_gen, tokenizer):
     print(f"[worker] processing task {task_id} query={query!r}", flush=True)
     status = "failed"
     try:
-        # 1. Check if it's a direct arXiv ID/URL
-        direct_result = process_direct_arxiv_request(query)
+        # 1. Check if it's a direct URL or arXiv ID
+        direct_result = process_direct_input(query)
         
         if direct_result:
-            print(f"[worker] direct arXiv ingestion result: {direct_result}", flush=True)
+            print(f"[worker] direct ingestion result: {direct_result}", flush=True)
             result_msg = direct_result
             status = "success"
         else:
             # 2. Fallback to search pipeline
             # Call the efficient function, passing in the initialized clients
-            # Note: search_and_run_pipeline currently doesn't accept 'client' arg in the file I saw earlier,
-            # but the previous worker code was passing it: search_and_run_pipeline(query, client)
-            # Let me double check rag_ingestion_service.py signature.
-            # It was: def search_and_run_pipeline(query: str, max_results: int = 2):
-            # It does NOT take client. The worker code I saw earlier was:
-            # result_msg = search_and_run_pipeline(query, client)
-            # This implies the worker code I read might have been slightly out of sync or I misread.
-            # Wait, looking at rag_ingestion_service.py content I read in Step 38:
-            # def search_and_run_pipeline(query: str, max_results: int = 2):
-            # It does NOT take client.
-            # However, the worker.py I read in Step 33 had:
-            # result_msg = search_and_run_pipeline(query, client)
-            # This would have failed if run! 
-            # I should fix this call as well to match the signature.
-            
-            result_msg = search_and_run_pipeline(query)
+            # We restrict max_results=1 to ingest only the most relevant file
+            result_msg = search_and_run_pipeline(query, max_results=1)
             print(f"[worker] ingestion returned: {str(result_msg)[:400]}", flush=True)
             
             if result_msg and "No results found" in result_msg:
