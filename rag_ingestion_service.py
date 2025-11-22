@@ -845,9 +845,45 @@ def search_and_run_pipeline(query: str, max_results: int = 2):
         )
         results = list(search.results())
 
+        # --- Fallback: If no results and query was modified (or contains special chars), try raw/cleaned query ---
         if not results:
-            print(f"[INFO] No results found on arXiv for query: '{effective_query}'", flush=True)
-            return
+            print(f"[INFO] No results found for '{effective_query}'. Trying fallback strategies...", flush=True)
+            
+            # Strategy 1: If we used categories, try the original query
+            if effective_query != query:
+                print(f"[INFO] Fallback 1: Trying original query '{query}'", flush=True)
+                search = arxiv.Search(query=query, max_results=pool_size, sort_by=arxiv.SortCriterion.Relevance, sort_order=arxiv.SortOrder.Descending)
+                results = list(search.results())
+
+            # Strategy 2: If still no results, try cleaning the query (remove special chars)
+            if not results:
+                clean_query = re.sub(r'[^\w\s]', '', query).strip()
+                if clean_query != query and clean_query:
+                    print(f"[INFO] Fallback 2: Trying cleaned query '{clean_query}'", flush=True)
+                    search = arxiv.Search(query=clean_query, max_results=pool_size, sort_by=arxiv.SortCriterion.Relevance, sort_order=arxiv.SortOrder.Descending)
+                    results = list(search.results())
+
+            # Strategy 3: Try searching as a title specifically
+            if not results:
+                print(f"[INFO] Fallback 3: Trying title search for '{query}'", flush=True)
+                # arxiv supports ti:title
+                title_query = f'ti:"{query}"'
+                search = arxiv.Search(query=title_query, max_results=pool_size, sort_by=arxiv.SortCriterion.Relevance, sort_order=arxiv.SortOrder.Descending)
+                results = list(search.results())
+
+            # Strategy 4: Split into keywords and search with OR (broad search)
+            if not results:
+                keywords = query.split()
+                if len(keywords) > 1:
+                    or_query = " OR ".join(keywords)
+                    print(f"[INFO] Fallback 4: Trying broad keyword search '{or_query}'", flush=True)
+                    search = arxiv.Search(query=or_query, max_results=pool_size, sort_by=arxiv.SortCriterion.Relevance, sort_order=arxiv.SortOrder.Descending)
+                    results = list(search.results())
+
+        if not results:
+            msg = f"No results found on arXiv for query: '{query}' (and fallbacks)"
+            print(f"[INFO] {msg}", flush=True)
+            return msg
 
         print(f"[INFO] Retrieved {len(results)} candidate papers from arXiv. Re-ranking by recency+relevance.", flush=True)
 
@@ -900,9 +936,13 @@ def search_and_run_pipeline(query: str, max_results: int = 2):
         
         # Now, call the original pipeline using this new file
         run_pipeline(input_file_path=temp_file_path)
+        
+        return f"Successfully ingested {len(download_tasks)} papers for query: '{query}'"
 
     except Exception as e:
-        print(f"[ERROR] An error occurred during the arXiv search: {e}", flush=True)
+        err_msg = f"An error occurred during the arXiv search: {e}"
+        print(f"[ERROR] {err_msg}", flush=True)
+        return err_msg
 
 
 

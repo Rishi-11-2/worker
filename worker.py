@@ -130,7 +130,13 @@ def _process_payload(payload: str, client, emb_gen, tokenizer):
             
             result_msg = search_and_run_pipeline(query)
             print(f"[worker] ingestion returned: {str(result_msg)[:400]}", flush=True)
-            status = "success"
+            
+            if result_msg and "No results found" in result_msg:
+                 status = "failed"
+            elif result_msg and "Error" in result_msg:
+                 status = "failed"
+            else:
+                 status = "success"
     except Exception as e:
         print(f"[worker] ingestion exception for {task_id}: {e}", flush=True)
         print(traceback.format_exc(), flush=True)
