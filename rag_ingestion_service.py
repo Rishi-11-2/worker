@@ -67,7 +67,7 @@ CORE_API_KEY = os.environ.get("CORE_API_KEY")
 # --- Qdrant ---
 QDRANT_URL = os.environ.get("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY", None)
-QDRANT_COLLECTION = "documents_chunks"
+QDRANT_COLLECTION = "document_chunks"
 
 # --- Ingestion Settings ---
 PAPER_DIR = "./papers"
@@ -477,8 +477,16 @@ def normalize_string(s: str) -> str:
     return re.sub(r'\W+', '', s.lower())
 
 def model_query(query: str) -> str:
-    """Uses LLM to convert topic keywords into ArXiv category codes."""
+    """
+    Uses LLM to convert topic keywords into ArXiv category codes.
+    Fallback: If LLM fails, returns comma-separated parts of the query.
+    """
     print(f"[INFO] No results found. Expanding query '{query}' using LLM...", flush=True)
+    
+    # Suppress LiteLLM logs
+    import logging
+    logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+    
     prompt = f"""
     You are an assistant that converts topic keywords into arXiv category codes.
     Input: {query}
@@ -488,15 +496,21 @@ def model_query(query: str) -> str:
     try:
         # Using the model from user's previous code
         resp = completion(
-            model="openrouter/minimax/minimax-m2:free",
+            model="openrouter/openai/gpt-oss-20b:free",
             messages=[{"role":"system","content":"You are a concise conversion assistant."},
                       {"role":"user","content":prompt}],
             api_key=os.environ.get("OPENROUTER_API_KEY"),
         )
-        return resp.choices[0].message.content.strip()
+        content = resp.choices[0].message.content.strip()
+        if not content: raise ValueError("Empty response from LLM")
+        return content
     except Exception as e:
         print(f"[WARN] LLM expansion failed: {e}")
-        return ""
+        print(f"[INFO] Falling back to simple keyword splitting.")
+        # Fallback: Just use the query parts as keywords
+        # e.g. "Machine Learning, Deep Learning" -> "Machine Learning, Deep Learning"
+        # This allows the retry logic to run with shorter chunks if the original was too long
+        return query
 
 def process_direct_input(query: str) -> bool:
     """
@@ -557,7 +571,7 @@ def unified_search_and_run(query: str, max_results: int = 5):
     """
     1. Check direct input.
     2. Search (ArXiv, S2, CORE).
-    3. If NO results -> LLM Expand -> Retry ArXiv.
+    3. If NO results OR Errors -> LLM Expand -> Retry ALL sources.
     4. Deduplicate, Rank, Ingest.
     """
     # 0. Direct Input
@@ -571,20 +585,54 @@ def unified_search_and_run(query: str, max_results: int = 5):
     
     # 2. Gather Candidates
     all_candidates: List[PaperCandidate] = []
+    errors_occurred = False
     
+    # Helper to run searches safely
+    def run_searches(q, limit):
+        cands = []
+        # ArXiv
+        cands.extend(search_arxiv_candidates(q, limit))
+        
+        # Semantic Scholar (catch errors)
+        try:
+            s2_cands = search_semantic_scholar_candidates(q, limit)
+            if not s2_cands and " " in q and len(q) > 50: # likely a complex query failure
+                raise ValueError("Complex query yielded no results or failed")
+            cands.extend(s2_cands)
+        except Exception as e:
+            print(f"[WARN] Semantic Scholar search failed for '{q}': {e}")
+            nonlocal errors_occurred
+            errors_occurred = True
+
+        # CORE (catch errors)
+        try:
+            core_cands = search_core_candidates(q, limit)
+            if not core_cands and " " in q and len(q) > 50:
+                raise ValueError("Complex query yielded no results or failed")
+            cands.extend(core_cands)
+        except Exception as e:
+            print(f"[WARN] CORE search failed for '{q}': {e}")
+            errors_occurred = True
+            
+        return cands
+
     # Initial Search
-    all_candidates.extend(search_arxiv_candidates(query, pool_size))
-    all_candidates.extend(search_semantic_scholar_candidates(query, pool_size))
-    all_candidates.extend(search_core_candidates(query, pool_size))
+    print("[INFO] Attempting Raw Search...")
+    all_candidates.extend(run_searches(query, pool_size))
     
-    # Fallback: LLM Expansion
-    if not all_candidates:
-        print(f"[INFO] No papers found for '{query}'. Attempting LLM expansion...")
+    # Fallback: LLM Expansion if (No Results OR Errors)
+    # We trigger this if we have 0 candidates, OR if we had errors (likely due to bad query)
+    if not all_candidates or errors_occurred:
+        reason = "No results found" if not all_candidates else "Errors occurred during raw search"
+        print(f"[INFO] {reason}. Attempting LLM expansion/refinement...")
+        
         categories = model_query(query)
         if categories:
-            print(f"[INFO] LLM suggested categories: {categories}")
-            # Retry ArXiv with categories
-            all_candidates.extend(search_arxiv_candidates(categories, pool_size))
+            print(f"[INFO] LLM suggested categories/keywords: {categories}")
+            # Retry ALL sources with the refined categories
+            # This helps S2/CORE which might have failed on the long raw query
+            print(f"[INFO] Retrying search with refined query: '{categories}'")
+            all_candidates.extend(run_searches(categories, pool_size))
     
     if not all_candidates:
         print(f"[ERROR] No papers found in any source (even after expansion).")
