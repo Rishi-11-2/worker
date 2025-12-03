@@ -28,11 +28,12 @@ The system consists of two main components:
 -   **State Management**: It maintains sets in Redis (`ingest:pending`, `ingest:processing`) to track task status and logs results to `ingest:results`.
 
 ### 2. Search & Selection (`rag_ingestion_service.py`)
-The `search_and_run_pipeline` function determines what to ingest:
+The `unified_search_and_run` function determines what to ingest:
 -   **Specific Title Search**: First, it checks if the query matches a specific paper title on ArXiv. If a high-confidence match is found, it selects that single paper.
 -   **Topic Search**: If no title match is found, it treats the query as a topic list.
-    -   It fetches a large pool of candidates from ArXiv.
-    -   It re-ranks them using a weighted score of **Relevance** (search rank) and **Recency** (publication date), heavily favoring new papers (`BETA_RECENCY = 0.7`).
+    -   It fetches a large pool of candidates from ArXiv, Semantic Scholar, and CORE.
+    -   It re-ranks them using a weighted score of **Relevance** (search rank) and **Recency** (publication date), heavily favoring new papers (`BETA_RECENCY = 0.6`).
+    -   Uses LLM-based query expansion as fallback when initial searches fail or return no results.
 -   **Download**: Selected papers are downloaded to the `./papers` directory.
 
 ### 3. The Ingestion Pipeline (`run_ingestion`)

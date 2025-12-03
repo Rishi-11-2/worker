@@ -783,19 +783,31 @@ def unified_search_and_run(query: str, max_results: int = 5):
     with open(temp_file, "w", encoding="utf-8") as f:
         f.write("\n".join(download_tasks))
     
-    # 6. Run Pipeline
-    downloaded_files = run_downloader(temp_file, PAPER_DIR, DOWNLOAD_TIMEOUT)
-    
-    if downloaded_files:
-        run_ingestion(downloaded_files)
-        print("\n--- Pipeline Complete: Success ---")
-    else:
-        print("\n--- Pipeline Complete: No files downloaded ---")
+    # 6-7. Run Pipeline with cleanup guarantee
+    try:
+        downloaded_files = run_downloader(temp_file, PAPER_DIR, DOWNLOAD_TIMEOUT)
+        
+        if downloaded_files:
+            run_ingestion(downloaded_files)
+            print("\n--- Pipeline Complete: Success ---")
+            
+            # 8. Cleanup Papers
+            print(f"[INFO] Cleaning up {len(downloaded_files)} downloaded papers...")
+            for fpath in downloaded_files:
+                try:
+                    if os.path.exists(fpath):
+                        os.remove(fpath)
+                except Exception as e:
+                    print(f"[WARN] Failed to delete {fpath}: {e}")
+            print("[INFO] Paper cleanup complete.")
+        else:
+            print("\n--- Pipeline Complete: No files downloaded ---")
+    finally:
+        # Always cleanup temp file
+        if os.path.exists(temp_file):
+            os.remove(temp_file)
+            print(f"[INFO] Cleaned up temporary file: {temp_file}")
 
-    # 7. Cleanup
-    if os.path.exists(temp_file):
-        os.remove(temp_file)
-        print(f"[INFO] Cleaned up temporary file: {temp_file}")
 
 
 if __name__ == "__main__":

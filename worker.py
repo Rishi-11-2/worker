@@ -59,13 +59,12 @@ def release_lock(lock_key="worker:lock"):
 try:
     # Import your ingestion function and the classes/constants needed to initialize
     from rag_ingestion_service import (
-        search_and_run_pipeline,
+        unified_search_and_run,
         process_direct_input,
         EmbeddingGenerator,
         TokenizerWrapper,
         QDRANT_URL,
         QDRANT_API_KEY,
-        OPEN_ROUTER_API_KEY,
         EMBEDDING_MODEL_NAME,
         EMBEDDING_DEVICE,
         TOKENIZER_NAME
@@ -114,7 +113,7 @@ def _process_payload(payload: str, client, emb_gen, tokenizer):
             # 2. Fallback to search pipeline
             # Call the efficient function, passing in the initialized clients
             # We restrict max_results=1 to ingest only the most relevant file
-            result_msg = search_and_run_pipeline(query, max_results=1)
+            result_msg = unified_search_and_run(query, max_results=1)
             print(f"[worker] ingestion returned: {str(result_msg)[:400]}", flush=True)
             
             if result_msg and "No results found" in result_msg:
@@ -196,13 +195,16 @@ if __name__ == "__main__":
     try:
         # Initialize clients ONCE at startup
         client = QdrantClient(url=QDRANT_URL, api_key=(QDRANT_API_KEY.strip() if QDRANT_API_KEY else None))
-        emb_gen = EmbeddingGenerator(model_name=EMBEDDING_MODEL_NAME, device=EMBEDDING_DEVICE)
-        tokenizer = TokenizerWrapper(encoding_name=TOKENIZER_NAME)
+        emb_gen = EmbeddingGenerator()
+        tokenizer = TokenizerWrapper()
     except Exception as e:
         print(f"[ERROR] Failed to initialize clients: {e}", flush=True)
         print(traceback.format_exc(), flush=True)
         sys.exit(1)
 
     if try_acquire_lock(lock_key="worker:lock", ttl=300):
+        try:
             process_batch_once(client, emb_gen, tokenizer, max_items=BATCH_MAX_ITEMS)
-
+        finally:
+            release_lock("worker:lock")
+            print("[worker] Lock released.", flush=True)
