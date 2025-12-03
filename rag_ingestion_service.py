@@ -75,9 +75,11 @@ DOWNLOAD_TIMEOUT = 60
 EMBEDDING_MODEL_NAME = 'sentence-transformers/paraphrase-MiniLM-L3-v2'
 EMBEDDING_DEVICE = "cpu"  # Change to "cuda" or "mps" if available
 
-# --- Chunking ---
-MAX_TOKENS = 450
-OVERLAP_TOKENS = 75
+# --- Chunking / Token Config ---
+# Reduced to 300 to ensure we don't exceed the 512 limit of the embedding model
+# (tiktoken counts are often lower than BERT tokenizer counts)
+MAX_TOKENS = 300
+OVERLAP_TOKENS = 50
 MIN_CHUNK_CHARS = 200
 MAX_CHUNK_CHARS = 600
 TOKENIZER_NAME = "cl100k_base"
@@ -366,6 +368,41 @@ def stable_id(filename, index, text):
     h = hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
     return f"{os.path.basename(filename)}::{index}::{h}"
 
+def calculate_file_hash(filepath: str) -> str:
+    """Calculates SHA256 hash of a file."""
+    sha256_hash = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        # Read and update hash string value in blocks of 4K
+        for byte_block in iter(lambda: f.read(4096), b""):
+            sha256_hash.update(byte_block)
+    return sha256_hash.hexdigest()
+
+def is_document_ingested(client: QdrantClient, collection_name: str, file_hash: str) -> bool:
+    """
+    Checks if a document with the given hash already exists in the collection.
+    """
+    try:
+        # Filter for points where 'doc_hash' == file_hash
+        scroll_filter = rest.Filter(
+            must=[
+                rest.FieldCondition(
+                    key="doc_hash",
+                    match=rest.MatchValue(value=file_hash)
+                )
+            ]
+        )
+        points, _ = client.scroll(
+            collection_name=collection_name,
+            scroll_filter=scroll_filter,
+            limit=1,
+            with_payload=False,
+            with_vectors=False
+        )
+        return bool(points)
+    except Exception as e:
+        # If collection doesn't exist or other error, assume not ingested
+        return False
+
 def run_ingestion(pdf_files):
     if not pdf_files: 
         print("[INFO] No files to ingest.", flush=True)
@@ -384,6 +421,12 @@ def run_ingestion(pdf_files):
                 QDRANT_COLLECTION, 
                 vectors_config=rest.VectorParams(size=384, distance=rest.Distance.COSINE)
             )
+            # Create payload index for doc_hash to make deduplication fast
+            client.create_payload_index(
+                collection_name=QDRANT_COLLECTION,
+                field_name="doc_hash",
+                field_schema=rest.PayloadSchemaType.KEYWORD
+            )
     except Exception as e:
         print(f"[ERROR] Could not connect to Qdrant: {e}")
         return
@@ -401,6 +444,18 @@ def run_ingestion(pdf_files):
     # 3. Process Files
     for pdf_path in pdf_files:
         filename = os.path.basename(pdf_path)
+        
+        # --- DEDUPLICATION ---
+        try:
+            file_hash = calculate_file_hash(pdf_path)
+            if is_document_ingested(client, QDRANT_COLLECTION, file_hash):
+                print(f"[INFO] File '{filename}' (hash: {file_hash[:8]}...) already ingested. Skipping.", flush=True)
+                continue
+        except Exception as e:
+            print(f"[WARN] Deduplication check failed for {filename}: {e}. Proceeding.")
+            file_hash = "unknown"
+        # ---------------------
+
         print(f"Processing: {filename}...", flush=True)
         
         try:
@@ -426,6 +481,7 @@ def run_ingestion(pdf_files):
                     # Metadata
                     meta = {
                         "source": filename,
+                        "doc_hash": file_hash, # Store hash for future dedup
                         "parent_chunk": i,
                         "text_preview": s[:150] + "..."
                     }
@@ -476,10 +532,12 @@ def normalize_string(s: str) -> str:
     if not s: return ""
     return re.sub(r'\W+', '', s.lower())
 
-def model_query(query: str) -> str:
+def model_query(query: str) -> Dict[str, str]:
     """
-    Uses LLM to convert topic keywords into ArXiv category codes.
-    Fallback: If LLM fails, returns comma-separated parts of the query.
+    Uses LLM to convert topic keywords into:
+    1. ArXiv category codes (for ArXiv)
+    2. Simplified keywords (for S2/CORE)
+    Returns a dict: {"arxiv": "...", "keywords": "..."}
     """
     print(f"[INFO] No results found. Expanding query '{query}' using LLM...", flush=True)
     
@@ -488,13 +546,14 @@ def model_query(query: str) -> str:
     logging.getLogger("LiteLLM").setLevel(logging.ERROR)
     
     prompt = f"""
-    You are an assistant that converts topic keywords into arXiv category codes.
+    You are an assistant that converts topic keywords into search queries.
     Input: {query}
-    Output: EXACTLY one line containing 5-10 arXiv category codes separated by commas (example: cs.AI, cs.LG, stat.ML).
-    Do NOT output JSON, bullet lists, or explanation.
+    Output: A JSON object with two keys:
+    - "arxiv": 5-10 arXiv category codes separated by commas (e.g. "cs.AI, cs.LG").
+    - "keywords": A concise, space-separated string of 3-5 main keywords suitable for semantic search (e.g. "Machine Learning Deep Learning").
+    Do NOT output markdown code blocks, just the raw JSON string.
     """
     try:
-        # Using the model from user's previous code
         resp = completion(
             model="openrouter/openai/gpt-oss-20b:free",
             messages=[{"role":"system","content":"You are a concise conversion assistant."},
@@ -502,15 +561,19 @@ def model_query(query: str) -> str:
             api_key=os.environ.get("OPENROUTER_API_KEY"),
         )
         content = resp.choices[0].message.content.strip()
-        if not content: raise ValueError("Empty response from LLM")
-        return content
+        # Clean up potential markdown code blocks
+        content = content.replace("```json", "").replace("```", "").strip()
+        
+        import json
+        data = json.loads(content)
+        return {
+            "arxiv": data.get("arxiv", ""),
+            "keywords": data.get("keywords", query)
+        }
     except Exception as e:
         print(f"[WARN] LLM expansion failed: {e}")
         print(f"[INFO] Falling back to simple keyword splitting.")
-        # Fallback: Just use the query parts as keywords
-        # e.g. "Machine Learning, Deep Learning" -> "Machine Learning, Deep Learning"
-        # This allows the retry logic to run with shorter chunks if the original was too long
-        return query
+        return {"arxiv": "", "keywords": query}
 
 def process_direct_input(query: str) -> bool:
     """
@@ -621,18 +684,34 @@ def unified_search_and_run(query: str, max_results: int = 5):
     all_candidates.extend(run_searches(query, pool_size))
     
     # Fallback: LLM Expansion if (No Results OR Errors)
-    # We trigger this if we have 0 candidates, OR if we had errors (likely due to bad query)
     if not all_candidates or errors_occurred:
         reason = "No results found" if not all_candidates else "Errors occurred during raw search"
         print(f"[INFO] {reason}. Attempting LLM expansion/refinement...")
         
-        categories = model_query(query)
-        if categories:
-            print(f"[INFO] LLM suggested categories/keywords: {categories}")
-            # Retry ALL sources with the refined categories
-            # This helps S2/CORE which might have failed on the long raw query
-            print(f"[INFO] Retrying search with refined query: '{categories}'")
-            all_candidates.extend(run_searches(categories, pool_size))
+        expanded_data = model_query(query)
+        
+        # 1. Retry ArXiv with Categories
+        arxiv_q = expanded_data.get("arxiv")
+        if arxiv_q:
+            print(f"[INFO] Retrying ArXiv with categories: '{arxiv_q}'")
+            all_candidates.extend(search_arxiv_candidates(arxiv_q, pool_size))
+            
+        # 2. Retry S2/CORE with Keywords
+        kw_q = expanded_data.get("keywords")
+        if kw_q and kw_q != query: # Only retry if different/simplified
+            print(f"[INFO] Retrying S2/CORE with simplified keywords: '{kw_q}'")
+            
+            # S2
+            try:
+                all_candidates.extend(search_semantic_scholar_candidates(kw_q, pool_size))
+            except Exception as e:
+                print(f"[WARN] S2 Retry failed: {e}")
+                
+            # CORE
+            try:
+                all_candidates.extend(search_core_candidates(kw_q, pool_size))
+            except Exception as e:
+                print(f"[WARN] CORE Retry failed: {e}")
     
     if not all_candidates:
         print(f"[ERROR] No papers found in any source (even after expansion).")
@@ -713,11 +792,16 @@ def unified_search_and_run(query: str, max_results: int = 5):
     else:
         print("\n--- Pipeline Complete: No files downloaded ---")
 
+    # 7. Cleanup
+    if os.path.exists(temp_file):
+        os.remove(temp_file)
+        print(f"[INFO] Cleaned up temporary file: {temp_file}")
+
 
 if __name__ == "__main__":
     
     # --- ENTER YOUR QUERY HERE ---
     USER_QUERY = "Machine learning ,Deep Learning, Reinforcement Learning , Meta Learning,LLMs,Agentic AI"
-    MAX_PAPERS = 10
+    MAX_PAPERS = 5
 
     unified_search_and_run(USER_QUERY, MAX_PAPERS)
