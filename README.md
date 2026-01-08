@@ -32,7 +32,13 @@ The `unified_search_and_run` function determines what to ingest:
 -   **Specific Title Search**: First, it checks if the query matches a specific paper title on ArXiv. If a high-confidence match is found, it selects that single paper.
 -   **Topic Search**: If no title match is found, it treats the query as a topic list.
     -   It fetches a large pool of candidates from ArXiv, Semantic Scholar, and CORE.
-    -   It re-ranks them using a weighted score of **Relevance** (search rank) and **Recency** (publication date), heavily favoring new papers (`BETA_RECENCY = 0.6`).
+    -   **ArXiv Fallback**: If Semantic Scholar and CORE both fail or return no results, the system automatically expands the ArXiv search to ensure good coverage.
+    -   It re-ranks papers using a **balanced scoring formula**:
+        | Signal | Weight | Description |
+        |--------|--------|-------------|
+        | Relevance | 30% | Search engine rank position |
+        | Recency | 40% | Exponential decay (~1 year half-life) |
+        | Quality | 30% | Log-scaled citation count from Semantic Scholar |
     -   Uses LLM-based query expansion as fallback when initial searches fail or return no results.
 -   **Download**: Selected papers are downloaded to the `./papers` directory.
 
@@ -73,6 +79,6 @@ The final step is storing the data in Qdrant:
 
 ## Configuration
 Key parameters in `rag_ingestion_service.py` allow tuning:
--   `POOL_MULTIPLIER` / `BETA_RECENCY`: Controls how "fresh" the topic search results are.
+-   `W_RELEVANCE` / `W_RECENCY` / `W_QUALITY`: Controls the balance between search rank, freshness, and citation quality in paper selection.
 -   `MAX_TOKENS` / `OVERLAP_TOKENS`: Controls chunk granularity.
 -   `QDRANT_UPSERT_BATCH`: Controls write performance to the DB.

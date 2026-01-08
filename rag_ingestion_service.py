@@ -107,6 +107,7 @@ class PaperCandidate:
     published_date: Optional[datetime.datetime]
     source: str
     original_rank: int
+    citation_count: int = 0  # Quality signal from Semantic Scholar
 
 
 # =================================================================
@@ -149,7 +150,7 @@ def search_semantic_scholar_candidates(query: str, limit: int) -> List[PaperCand
     params = {
         "query": query,
         "limit": limit * 2,
-        "fields": "title,openAccessPdf,publicationDate,url"
+        "fields": "title,openAccessPdf,publicationDate,url,citationCount"
     }
     headers = {}
     if SEMANTIC_SCHOLAR_API_KEY:
@@ -177,7 +178,8 @@ def search_semantic_scholar_candidates(query: str, limit: int) -> List[PaperCand
                         pdf_url=pdf_info.get("url"),
                         published_date=pub_date,
                         source="semantic_scholar",
-                        original_rank=idx
+                        original_rank=idx,
+                        citation_count=item.get("citationCount") or 0
                     ))
                     idx += 1
         else:
@@ -575,11 +577,11 @@ def model_query(query: str) -> Dict[str, str]:
         print(f"[INFO] Falling back to simple keyword splitting.")
         return {"arxiv": "", "keywords": query}
 
-def process_direct_input(query: str) -> bool:
+def process_direct_input(query: str) -> str:
     """
     Checks if query is a direct URL or ArXiv ID. 
     If so, downloads and ingests immediately.
-    Returns True if handled.
+    Returns a status message string if handled, or None if not a direct input.
     """
     query = query.strip()
 
@@ -609,10 +611,10 @@ def process_direct_input(query: str) -> bool:
             if res["ok"]:
                 run_ingestion([res["path"]])
                 print(f"[SUCCESS] Ingested ArXiv Paper: {arxiv_id}")
-                return True
+                return f"Success: Ingested ArXiv paper {arxiv_id}"
             else:
                 print(f"[ERROR] Failed to download ArXiv Paper: {res.get('error')}")
-                return True
+                return f"Error: Failed to download ArXiv paper {arxiv_id} - {res.get('error')}"
 
     # 1. Generic URL (non-ArXiv)
     if re.match(r'^https?://\S+$', query):
@@ -623,23 +625,25 @@ def process_direct_input(query: str) -> bool:
         if res["ok"]:
             run_ingestion([res["path"]])
             print(f"[SUCCESS] Ingested direct URL: {query}")
-            return True
+            return f"Success: Ingested direct URL"
         else:
             print(f"[ERROR] Failed to download URL: {res.get('error')}")
-            return True # Handled, even if failed
+            return f"Error: Failed to download URL - {res.get('error')}"
 
-    return False
+    return None
 
-def unified_search_and_run(query: str, max_results: int = 5):
+def unified_search_and_run(query: str, max_results: int = 5) -> str:
     """
     1. Check direct input.
     2. Search (ArXiv, S2, CORE).
     3. If NO results OR Errors -> LLM Expand -> Retry ALL sources.
     4. Deduplicate, Rank, Ingest.
+    Returns a status message string.
     """
     # 0. Direct Input
-    if process_direct_input(query):
-        return
+    direct_result = process_direct_input(query)
+    if direct_result:
+        return direct_result
 
     print(f"--- Starting Pipeline for Query: '{query}' ---")
     
@@ -651,17 +655,19 @@ def unified_search_and_run(query: str, max_results: int = 5):
     errors_occurred = False
     
     # Helper to run searches safely
-    def run_searches(q, limit):
+    def run_searches(q, limit, boost_arxiv=False):
         cands = []
-        # ArXiv
-        cands.extend(search_arxiv_candidates(q, limit))
+        s2_ok, core_ok = False, False
+        
+        # ArXiv - always runs, optionally with boosted limit
+        arxiv_limit = limit * 2 if boost_arxiv else limit
+        cands.extend(search_arxiv_candidates(q, arxiv_limit))
         
         # Semantic Scholar (catch errors)
         try:
             s2_cands = search_semantic_scholar_candidates(q, limit)
-            if not s2_cands and " " in q and len(q) > 50: # likely a complex query failure
-                raise ValueError("Complex query yielded no results or failed")
             cands.extend(s2_cands)
+            s2_ok = len(s2_cands) > 0
         except Exception as e:
             print(f"[WARN] Semantic Scholar search failed for '{q}': {e}")
             nonlocal errors_occurred
@@ -670,12 +676,17 @@ def unified_search_and_run(query: str, max_results: int = 5):
         # CORE (catch errors)
         try:
             core_cands = search_core_candidates(q, limit)
-            if not core_cands and " " in q and len(q) > 50:
-                raise ValueError("Complex query yielded no results or failed")
             cands.extend(core_cands)
+            core_ok = len(core_cands) > 0
         except Exception as e:
             print(f"[WARN] CORE search failed for '{q}': {e}")
             errors_occurred = True
+        
+        # If S2 and CORE both failed/empty, boost ArXiv results
+        if not s2_ok and not core_ok and not boost_arxiv:
+            print("[INFO] S2/CORE returned no results - expanding ArXiv search...")
+            extra_arxiv = search_arxiv_candidates(q, limit)  # Additional round
+            cands.extend(extra_arxiv)
             
         return cands
 
@@ -715,7 +726,7 @@ def unified_search_and_run(query: str, max_results: int = 5):
     
     if not all_candidates:
         print(f"[ERROR] No papers found in any source (even after expansion).")
-        return
+        return f"No results found for query: '{query}'"
 
     print(f"\n[INFO] Total raw candidates: {len(all_candidates)}", flush=True)
 
@@ -733,13 +744,18 @@ def unified_search_and_run(query: str, max_results: int = 5):
     
     print(f"[INFO] Candidates after deduplication: {len(unique_candidates)}", flush=True)
 
-    # 4. Scoring & Re-ranking
+    # 4. Scoring & Re-ranking (Quality + Recency + Relevance)
     now = datetime.datetime.now(datetime.timezone.utc)
     scored_candidates = []
+    
+    # Weights: balanced for quality research papers
+    W_RELEVANCE = 0.30   # Search engine rank
+    W_RECENCY = 0.40     # How new the paper is
+    W_QUALITY = 0.30     # Citation count (quality signal)
 
     for cand in unique_candidates:
-        # Recency Score
-        days_old = 3650 # Default 10 years if date unknown
+        # Recency Score - exponential decay with ~1 year half-life
+        days_old = 3650  # Default 10 years if date unknown
         if cand.published_date:
             # Ensure timezone awareness
             if cand.published_date.tzinfo is None:
@@ -750,13 +766,18 @@ def unified_search_and_run(query: str, max_results: int = 5):
             delta = now - p_date
             days_old = max(0, delta.days)
         
-        recency_score = 1.0 / (1 + days_old)
+        # Smoother decay: exp(-days/365) gives ~0.37 at 1 year, ~0.14 at 2 years
+        recency_score = math.exp(-days_old / 365.0)
         
         # Relevance Score (based on search rank)
         relevance_score = 1.0 / (1 + cand.original_rank)
         
+        # Quality Score (log-scaled citations, capped at 10 for normalization)
+        # Papers with 0 citations: 0, 10 citations: ~0.24, 100: ~0.46, 1000: ~0.69
+        quality_score = min(1.0, math.log(1 + cand.citation_count) / 10.0)
+        
         # Final Score
-        final_score = (ALPHA_RELEVANCE * relevance_score) + (BETA_RECENCY * recency_score)
+        final_score = (W_RELEVANCE * relevance_score) + (W_RECENCY * recency_score) + (W_QUALITY * quality_score)
         
         scored_candidates.append((final_score, cand))
 
@@ -800,8 +821,10 @@ def unified_search_and_run(query: str, max_results: int = 5):
                 except Exception as e:
                     print(f"[WARN] Failed to delete {fpath}: {e}")
             print("[INFO] Paper cleanup complete.")
+            return f"Success: Ingested {len(downloaded_files)} paper(s) for query '{query}'"
         else:
             print("\n--- Pipeline Complete: No files downloaded ---")
+            return f"No results found for query: '{query}' (download failed)"
     finally:
         # Always cleanup temp file
         if os.path.exists(temp_file):
