@@ -689,34 +689,63 @@ def unified_search_and_run(query: str, max_results: int = 5) -> str:
         cands = []
         s2_ok, core_ok = False, False
         
-        # ArXiv - always runs, optionally with boosted limit
-        arxiv_limit = limit * 2 if boost_arxiv else limit
-        cands.extend(search_arxiv_candidates(q, arxiv_limit))
+        # Split query by commas, semicolons, or 'and' to get individual topics
+        topics = [t.strip() for t in re.split(r'[,;]|\band\b', q, flags=re.IGNORECASE) if t.strip()]
+        per_topic_limit = max(3, limit // max(1, len(topics)))  # Distribute limit across topics
         
-        # Semantic Scholar (catch errors)
+        # --- ArXiv: SEARCH TOPICS INDIVIDUALLY ---
+        if len(topics) > 1:
+            arxiv_limit = per_topic_limit * 2 if boost_arxiv else per_topic_limit
+            print(f"[INFO] Searching ArXiv for {len(topics)} individual topics...")
+            for topic in topics:
+                topic_cands = search_arxiv_candidates(topic, arxiv_limit)
+                print(f"  - '{topic}': {len(topic_cands)} results")
+                cands.extend(topic_cands)
+        else:
+            arxiv_limit = limit * 2 if boost_arxiv else limit
+            cands.extend(search_arxiv_candidates(q, arxiv_limit))
+        
+        # --- Semantic Scholar: SEARCH TOPICS INDIVIDUALLY ---
         try:
-            s2_cands = search_semantic_scholar_candidates(q, limit)
-            cands.extend(s2_cands)
-            s2_ok = len(s2_cands) > 0
+            if len(topics) > 1:
+                print(f"[INFO] Searching Semantic Scholar for {len(topics)} individual topics...")
+                for topic in topics:
+                    topic_cands = search_semantic_scholar_candidates(topic, per_topic_limit)
+                    print(f"  - '{topic}': {len(topic_cands)} results")
+                    cands.extend(topic_cands)
+                    s2_ok = s2_ok or len(topic_cands) > 0
+            else:
+                s2_cands = search_semantic_scholar_candidates(q, limit)
+                cands.extend(s2_cands)
+                s2_ok = len(s2_cands) > 0
         except Exception as e:
-            print(f"[WARN] Semantic Scholar search failed for '{q}': {e}")
+            print(f"[WARN] Semantic Scholar search failed: {e}")
             nonlocal errors_occurred
             errors_occurred = True
 
-        # CORE (catch errors)
+        # --- CORE: SEARCH TOPICS INDIVIDUALLY ---
         try:
-            core_cands = search_core_candidates(q, limit)
-            cands.extend(core_cands)
-            core_ok = len(core_cands) > 0
+            if len(topics) > 1:
+                print(f"[INFO] Searching CORE for {len(topics)} individual topics...")
+                for topic in topics:
+                    topic_cands = search_core_candidates(topic, per_topic_limit)
+                    print(f"  - '{topic}': {len(topic_cands)} results")
+                    cands.extend(topic_cands)
+                    core_ok = core_ok or len(topic_cands) > 0
+            else:
+                core_cands = search_core_candidates(q, limit)
+                cands.extend(core_cands)
+                core_ok = len(core_cands) > 0
         except Exception as e:
-            print(f"[WARN] CORE search failed for '{q}': {e}")
+            print(f"[WARN] CORE search failed: {e}")
             errors_occurred = True
         
         # If S2 and CORE both failed/empty, boost ArXiv results
         if not s2_ok and not core_ok and not boost_arxiv:
             print("[INFO] S2/CORE returned no results - expanding ArXiv search...")
-            extra_arxiv = search_arxiv_candidates(q, limit)  # Additional round
-            cands.extend(extra_arxiv)
+            for topic in (topics if len(topics) > 1 else [q]):
+                extra_arxiv = search_arxiv_candidates(topic, per_topic_limit)
+                cands.extend(extra_arxiv)
             
         return cands
 
