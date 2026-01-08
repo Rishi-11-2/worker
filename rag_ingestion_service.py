@@ -23,6 +23,7 @@ import time
 import math
 import re
 import datetime
+import random
 from typing import List, Dict, Any, Optional
 from urllib.parse import urlparse, unquote
 from dataclasses import dataclass
@@ -76,12 +77,12 @@ EMBEDDING_MODEL_NAME = 'sentence-transformers/paraphrase-MiniLM-L3-v2'
 EMBEDDING_DEVICE = "cpu"  # Change to "cuda" or "mps" if available
 
 # --- Chunking / Token Config ---
-# Reduced to 300 to ensure we don't exceed the 512 limit of the embedding model
-# (tiktoken counts are often lower than BERT tokenizer counts)
-MAX_TOKENS = 300
-OVERLAP_TOKENS = 50
-MIN_CHUNK_CHARS = 200
-MAX_CHUNK_CHARS = 600
+# Reduced to 256 to ensure we stay well under 512 limit of the embedding model
+# (tiktoken counts can differ from BERT tokenizer counts by 50%+)
+MAX_TOKENS = 256
+OVERLAP_TOKENS = 40
+MIN_CHUNK_CHARS = 150
+MAX_CHUNK_CHARS = 500
 TOKENIZER_NAME = "cl100k_base"
 EMBED_BATCH_SIZE = 256
 QDRANT_UPSERT_BATCH = 256
@@ -405,6 +406,30 @@ def is_document_ingested(client: QdrantClient, collection_name: str, file_hash: 
         # If collection doesn't exist or other error, assume not ingested
         return False
 
+def is_title_ingested(client: QdrantClient, collection_name: str, title_hash: str) -> bool:
+    """
+    Checks if a paper with the given title hash already exists (pre-download check).
+    """
+    try:
+        scroll_filter = rest.Filter(
+            must=[
+                rest.FieldCondition(
+                    key="title_hash",
+                    match=rest.MatchValue(value=title_hash)
+                )
+            ]
+        )
+        points, _ = client.scroll(
+            collection_name=collection_name,
+            scroll_filter=scroll_filter,
+            limit=1,
+            with_payload=False,
+            with_vectors=False
+        )
+        return bool(points)
+    except Exception as e:
+        return False
+
 def run_ingestion(pdf_files):
     if not pdf_files: 
         print("[INFO] No files to ingest.", flush=True)
@@ -481,9 +506,14 @@ def run_ingestion(pdf_files):
                     sub_ids.append(sid)
                     
                     # Metadata
+                    # Extract title from filename (remove .pdf extension)
+                    paper_title = os.path.splitext(filename)[0]
+                    title_hash = hashlib.sha256(normalize_string(paper_title).encode()).hexdigest()[:16]
+                    
                     meta = {
                         "source": filename,
                         "doc_hash": file_hash, # Store hash for future dedup
+                        "title_hash": title_hash, # Store title hash for pre-download dedup
                         "parent_chunk": i,
                         "text_preview": s[:150] + "..."
                     }
@@ -744,17 +774,24 @@ def unified_search_and_run(query: str, max_results: int = 5) -> str:
     
     print(f"[INFO] Candidates after deduplication: {len(unique_candidates)}", flush=True)
 
-    # 4. Scoring & Re-ranking (Quality + Recency + Relevance)
+    # 4. Scoring & Re-ranking (Quality + Recency + Relevance + Rotation + Novelty)
     now = datetime.datetime.now(datetime.timezone.utc)
     scored_candidates = []
     
-    # Weights: balanced for quality research papers
-    W_RELEVANCE = 0.30   # Search engine rank
-    W_RECENCY = 0.40     # How new the paper is
-    W_QUALITY = 0.30     # Citation count (quality signal)
+    # Date-seeded random for paper rotation (changes every 3 days)
+    # This ensures different papers are selected on different runs
+    rotation_seed = now.toordinal() // 3  # Changes every 3 days
+    random.seed(rotation_seed)
+    
+    # Weights: FAVOR NEW PAPERS - breakthrough research from top labs may have few citations
+    W_RELEVANCE = 0.20   # Search engine rank
+    W_RECENCY = 0.30     # How new the paper is (exponential decay)
+    W_NOVELTY = 0.20     # Bonus for very recent papers (<30 days) - catches new releases
+    W_QUALITY = 0.10     # Citation count (reduced - new papers have few citations)
+    W_ROTATION = 0.20    # Random factor for variety (increased for more diversity)
 
     for cand in unique_candidates:
-        # Recency Score - exponential decay with ~1 year half-life
+        # Calculate days old
         days_old = 3650  # Default 10 years if date unknown
         if cand.published_date:
             # Ensure timezone awareness
@@ -766,25 +803,93 @@ def unified_search_and_run(query: str, max_results: int = 5) -> str:
             delta = now - p_date
             days_old = max(0, delta.days)
         
-        # Smoother decay: exp(-days/365) gives ~0.37 at 1 year, ~0.14 at 2 years
+        # Recency Score - exponential decay with ~1 year half-life
+        # exp(-days/365) gives ~0.37 at 1 year, ~0.14 at 2 years
         recency_score = math.exp(-days_old / 365.0)
+        
+        # Novelty Bonus - high score for very recent papers (<30 days)
+        # This ensures new papers from DeepSeek, Meta, DeepMind get priority
+        # Papers <7 days: 1.0, <14 days: 0.9, <30 days: 0.7, >30 days: 0
+        if days_old <= 7:
+            novelty_score = 1.0
+        elif days_old <= 14:
+            novelty_score = 0.9
+        elif days_old <= 30:
+            novelty_score = 0.7
+        elif days_old <= 60:
+            novelty_score = 0.3
+        else:
+            novelty_score = 0.0
         
         # Relevance Score (based on search rank)
         relevance_score = 1.0 / (1 + cand.original_rank)
         
-        # Quality Score (log-scaled citations, capped at 10 for normalization)
-        # Papers with 0 citations: 0, 10 citations: ~0.24, 100: ~0.46, 1000: ~0.69
+        # Quality Score (log-scaled citations, but with lower weight)
+        # New papers from top labs may have 0 citations but are still excellent
         quality_score = min(1.0, math.log(1 + cand.citation_count) / 10.0)
         
+        # Rotation Score - deterministic per-paper random (same seed = same shuffle)
+        # Uses title hash so same paper gets same random value on same day
+        title_seed = hash(normalize_string(cand.title)) & 0xFFFFFFFF
+        random.seed(rotation_seed + title_seed)
+        rotation_score = random.random()
+        
         # Final Score
-        final_score = (W_RELEVANCE * relevance_score) + (W_RECENCY * recency_score) + (W_QUALITY * quality_score)
+        final_score = (
+            W_RELEVANCE * relevance_score + 
+            W_RECENCY * recency_score + 
+            W_NOVELTY * novelty_score +
+            W_QUALITY * quality_score + 
+            W_ROTATION * rotation_score
+        )
         
         scored_candidates.append((final_score, cand))
 
     # Sort descending
     scored_candidates.sort(key=lambda x: x[0], reverse=True)
     
-    # Select top N
+    # 5. Pre-download deduplication: filter out papers already in VectorDB
+    print(f"[INFO] Checking for already-ingested papers...", flush=True)
+    try:
+        qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=10.0)
+        
+        # Create title_hash index if not exists (idempotent)
+        try:
+            qdrant_client.create_payload_index(
+                collection_name=QDRANT_COLLECTION,
+                field_name="title_hash",
+                field_schema=rest.PayloadSchemaType.KEYWORD
+            )
+        except: pass  # Index may already exist
+        
+        # Filter candidates
+        filtered_candidates = []
+        skipped_count = 0
+        
+        for score, cand in scored_candidates:
+            title_hash = hashlib.sha256(normalize_string(cand.title).encode()).hexdigest()[:16]
+            
+            if is_title_ingested(qdrant_client, QDRANT_COLLECTION, title_hash):
+                skipped_count += 1
+                continue
+            
+            filtered_candidates.append((score, cand))
+            
+            # Stop once we have enough new papers
+            if len(filtered_candidates) >= max_results:
+                break
+        
+        if skipped_count > 0:
+            print(f"[INFO] Skipped {skipped_count} already-ingested papers.", flush=True)
+        
+        scored_candidates = filtered_candidates
+        
+    except Exception as e:
+        print(f"[WARN] Pre-download dedup check failed: {e}. Proceeding without filtering.")
+        # Fall back to simple top N selection
+        scored_candidates = scored_candidates[:max_results]
+    
+    # Select papers
     selected = [x[1] for x in scored_candidates[:max_results]]
     
     print(f"\n[INFO] Top {len(selected)} Selected Papers:", flush=True)

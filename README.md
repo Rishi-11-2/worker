@@ -33,12 +33,15 @@ The `unified_search_and_run` function determines what to ingest:
 -   **Topic Search**: If no title match is found, it treats the query as a topic list.
     -   It fetches a large pool of candidates from ArXiv, Semantic Scholar, and CORE.
     -   **ArXiv Fallback**: If Semantic Scholar and CORE both fail or return no results, the system automatically expands the ArXiv search to ensure good coverage.
-    -   It re-ranks papers using a **balanced scoring formula**:
+    -   It re-ranks papers using a **balanced scoring formula** that favors NEW papers:
         | Signal | Weight | Description |
         |--------|--------|-------------|
-        | Relevance | 30% | Search engine rank position |
-        | Recency | 40% | Exponential decay (~1 year half-life) |
-        | Quality | 30% | Log-scaled citation count from Semantic Scholar |
+        | Relevance | 20% | Search engine rank position |
+        | Recency | 30% | Exponential decay (~1 year half-life) |
+        | **Novelty** | **20%** | Bonus for papers <30 days old (catches DeepSeek, Meta, DeepMind releases) |
+        | Quality | 10% | Log-scaled citation count (low weight - new papers have few citations) |
+        | Rotation | 20% | Date-seeded random factor (changes every 3 days) |
+    -   **Pre-download Deduplication**: Before downloading, papers are checked against Qdrant using a `title_hash` to skip already-ingested content.
     -   Uses LLM-based query expansion as fallback when initial searches fail or return no results.
 -   **Download**: Selected papers are downloaded to the `./papers` directory.
 
