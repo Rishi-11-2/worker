@@ -77,12 +77,12 @@ EMBEDDING_MODEL_NAME = 'sentence-transformers/paraphrase-MiniLM-L3-v2'
 EMBEDDING_DEVICE = "cpu"  # Change to "cuda" or "mps" if available
 
 # --- Chunking / Token Config ---
-# Reduced to 256 to ensure we stay well under 512 limit of the embedding model
-# (tiktoken counts can differ from BERT tokenizer counts by 50%+)
-MAX_TOKENS = 256
-OVERLAP_TOKENS = 40
-MIN_CHUNK_CHARS = 150
-MAX_CHUNK_CHARS = 500
+# BERT tokenizer produces ~50-100% more tokens than tiktoken for the same text
+# Setting MAX_TOKENS=180 ensures BERT stays well under 512 limit
+MAX_TOKENS = 180
+OVERLAP_TOKENS = 30
+MIN_CHUNK_CHARS = 100
+MAX_CHUNK_CHARS = 400
 TOKENIZER_NAME = "cl100k_base"
 EMBED_BATCH_SIZE = 256
 QDRANT_UPSERT_BATCH = 256
