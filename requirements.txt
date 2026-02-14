@@ -12,3 +12,4 @@ litellm
 pandas
 pydantic
 aiohttp
+groq

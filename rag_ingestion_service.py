@@ -35,6 +35,7 @@ from dotenv import load_dotenv
 import tiktoken
 from sentence_transformers import SentenceTransformer
 from litellm import completion
+from groq import Groq
 
 # --- Qdrant ---
 from qdrant_client import QdrantClient
@@ -120,13 +121,14 @@ def search_arxiv_candidates(query: str, limit: int) -> List[PaperCandidate]:
     print(f"[SEARCH] Querying ArXiv for '{query}'...", flush=True)
     candidates = []
     try:
+        client = arxiv.Client()
         search = arxiv.Search(
             query=query,
             max_results=limit,
             sort_by=arxiv.SortCriterion.Relevance,
             sort_order=arxiv.SortOrder.Descending,
         )
-        for i, res in enumerate(search.results()):
+        for i, res in enumerate(client.results(search)):
             candidates.append(PaperCandidate(
                 title=res.title,
                 pdf_url=res.pdf_url,
@@ -586,11 +588,11 @@ def model_query(query: str) -> Dict[str, str]:
     Do NOT output markdown code blocks, just the raw JSON string.
     """
     try:
-        resp = completion(
-            model="openrouter/openai/gpt-oss-20b:free",
+        resp = client.chat.completions.create(
+            model="openai/gpt-oss-20b",
             messages=[{"role":"system","content":"You are a concise conversion assistant."},
                       {"role":"user","content":prompt}],
-            api_key=os.environ.get("OPENROUTER_API_KEY"),
+            api_key=os.environ.get("GROQ_API_KEY"),
         )
         content = resp.choices[0].message.content.strip()
         # Clean up potential markdown code blocks
@@ -970,7 +972,7 @@ def unified_search_and_run(query: str, max_results: int = 5) -> str:
 if __name__ == "__main__":
     
     # --- ENTER YOUR QUERY HERE ---
-    USER_QUERY = "Machine learning ,Deep Learning, Reinforcement Learning , Meta Learning,LLMs,Agentic AI"
+    USER_QUERY = "Machine learning ,Deep Learning, Reinforcement Learning , Meta Learning,LLMs,Agentic AI, Agents, Attention, Transformers, Diffusion Models, Generative AI"
     MAX_PAPERS = 5
 
     unified_search_and_run(USER_QUERY, MAX_PAPERS)
