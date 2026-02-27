@@ -308,9 +308,9 @@ def download_one(session, url, title, dest_folder, timeout):
                 for chunk in resp.iter_content(chunk_size=32768):
                     if chunk: f.write(chunk)
             
-            return {"url": url, "path": fullpath, "ok": True}
+            return {"url": url, "path": fullpath, "ok": True, "original_title": title}
     except Exception as e:
-        return {"url": url, "error": str(e), "ok": False}
+        return {"url": url, "error": str(e), "ok": False, "original_title": title}
 
 def run_downloader(input_file_path, dest_folder, timeout):
     """Reads URLs from a file and downloads them."""
@@ -332,7 +332,7 @@ def run_downloader(input_file_path, dest_folder, timeout):
     for url, title in tqdm(tasks, desc="Download"):
         res = download_one(session, url, title, dest_folder, timeout)
         if res["ok"]: 
-            succ_files.append(res["path"])
+            succ_files.append({"path": res["path"], "original_title": res.get("original_title")})
         else: 
             print(f"  [FAIL] {url} -> {res.get('error')}")
             
@@ -433,9 +433,24 @@ def is_title_ingested(client: QdrantClient, collection_name: str, title_hash: st
         return False
 
 def run_ingestion(pdf_files):
+    """Ingest PDF files into Qdrant.
+    
+    Args:
+        pdf_files: List of dicts with 'path' and optional 'original_title' keys,
+                   or list of plain file path strings (for backward compat).
+    """
     if not pdf_files: 
         print("[INFO] No files to ingest.", flush=True)
         return
+    
+    # Normalize input: accept both dicts and plain paths
+    normalized = []
+    for item in pdf_files:
+        if isinstance(item, dict):
+            normalized.append(item)
+        else:
+            normalized.append({"path": item, "original_title": None})
+    pdf_files = normalized
     
     print(f"\n--- Ingesting {len(pdf_files)} PDFs into Qdrant ---", flush=True)
     
@@ -471,7 +486,9 @@ def run_ingestion(pdf_files):
         return
 
     # 3. Process Files
-    for pdf_path in pdf_files:
+    for pdf_entry in pdf_files:
+        pdf_path = pdf_entry["path"]
+        original_title = pdf_entry.get("original_title")
         filename = os.path.basename(pdf_path)
         
         # --- DEDUPLICATION ---
@@ -508,14 +525,16 @@ def run_ingestion(pdf_files):
                     sub_ids.append(sid)
                     
                     # Metadata
-                    # Extract title from filename (remove .pdf extension)
-                    paper_title = os.path.splitext(filename)[0]
+                    # Use original API title for title_hash (matches pre-download dedup)
+                    # Fall back to filename-derived title if original not available
+                    paper_title = original_title if original_title else os.path.splitext(filename)[0]
                     title_hash = hashlib.sha256(normalize_string(paper_title).encode()).hexdigest()[:16]
                     
                     meta = {
                         "source": filename,
                         "doc_hash": file_hash, # Store hash for future dedup
                         "title_hash": title_hash, # Store title hash for pre-download dedup
+                        "paper_title": paper_title, # Store original title
                         "parent_chunk": i,
                         "text_preview": s[:150] + "..."
                     }
@@ -588,11 +607,11 @@ def model_query(query: str) -> Dict[str, str]:
     Do NOT output markdown code blocks, just the raw JSON string.
     """
     try:
-        resp = client.chat.completions.create(
-            model="openai/gpt-oss-20b",
+        groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        resp = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
             messages=[{"role":"system","content":"You are a concise conversion assistant."},
                       {"role":"user","content":prompt}],
-            api_key=os.environ.get("GROQ_API_KEY"),
         )
         content = resp.choices[0].message.content.strip()
         # Clean up potential markdown code blocks
@@ -641,7 +660,7 @@ def process_direct_input(query: str) -> str:
             session.headers.update({"User-Agent": "ResearchBot/1.0"})
             res = download_one(session, pdf_url, None, PAPER_DIR, DOWNLOAD_TIMEOUT)
             if res["ok"]:
-                run_ingestion([res["path"]])
+                run_ingestion([{"path": res["path"], "original_title": res.get("original_title")}])
                 print(f"[SUCCESS] Ingested ArXiv Paper: {arxiv_id}")
                 return f"Success: Ingested ArXiv paper {arxiv_id}"
             else:
@@ -655,7 +674,7 @@ def process_direct_input(query: str) -> str:
         session.headers.update({"User-Agent": "ResearchBot/1.0"})
         res = download_one(session, query, None, PAPER_DIR, DOWNLOAD_TIMEOUT)
         if res["ok"]:
-            run_ingestion([res["path"]])
+            run_ingestion([{"path": res["path"], "original_title": res.get("original_title")}])
             print(f"[SUCCESS] Ingested direct URL: {query}")
             return f"Success: Ingested direct URL"
         else:
@@ -796,12 +815,24 @@ def unified_search_and_run(query: str, max_results: int = 5) -> str:
     # Since we appended lists in order (ArXiv, S2, Core), this prioritizes ArXiv links.
     unique_candidates = []
     seen_titles = set()
+    seen_urls = set()
     
     for cand in all_candidates:
         norm_title = normalize_string(cand.title)
-        if norm_title and norm_title not in seen_titles:
+        # Normalize URL: strip trailing slashes and query params for comparison
+        norm_url = cand.pdf_url.split("?")[0].rstrip("/").lower() if cand.pdf_url else ""
+        
+        # Skip if we've seen this title OR this URL before
+        if norm_title and norm_title in seen_titles:
+            continue
+        if norm_url and norm_url in seen_urls:
+            continue
+        
+        if norm_title:
             seen_titles.add(norm_title)
-            unique_candidates.append(cand)
+        if norm_url:
+            seen_urls.add(norm_url)
+        unique_candidates.append(cand)
     
     print(f"[INFO] Candidates after deduplication: {len(unique_candidates)}", flush=True)
 
@@ -950,7 +981,8 @@ def unified_search_and_run(query: str, max_results: int = 5) -> str:
             
             # 8. Cleanup Papers
             print(f"[INFO] Cleaning up {len(downloaded_files)} downloaded papers...")
-            for fpath in downloaded_files:
+            for fentry in downloaded_files:
+                fpath = fentry["path"] if isinstance(fentry, dict) else fentry
                 try:
                     if os.path.exists(fpath):
                         os.remove(fpath)
@@ -973,6 +1005,28 @@ if __name__ == "__main__":
     
     # --- ENTER YOUR QUERY HERE ---
     USER_QUERY = "Machine learning ,Deep Learning, Reinforcement Learning , Meta Learning,LLMs,Agentic AI, Agents, Attention, Transformers, Diffusion Models, Generative AI"
-    MAX_PAPERS = 5
+    MAX_PAPERS_PER_TOPIC = 2  # Papers to ingest per individual topic
 
-    unified_search_and_run(USER_QUERY, MAX_PAPERS)
+    # Split multi-topic queries and process each topic independently
+    # This ensures every topic gets coverage instead of popular topics dominating
+    topics = [t.strip() for t in re.split(r'[,;]', USER_QUERY) if t.strip()]
+    
+    if len(topics) <= 1:
+        # Single topic: run directly
+        unified_search_and_run(USER_QUERY, MAX_PAPERS_PER_TOPIC)
+    else:
+        print(f"[INFO] Detected {len(topics)} topics. Processing each individually...")
+        total_ingested = 0
+        for i, topic in enumerate(topics, 1):
+            print(f"\n{'='*60}")
+            print(f"[TOPIC {i}/{len(topics)}] {topic}")
+            print(f"{'='*60}")
+            result = unified_search_and_run(topic, MAX_PAPERS_PER_TOPIC)
+            if result and result.startswith("Success"):
+                total_ingested += 1
+            # Small delay between topics to be respectful to APIs
+            if i < len(topics):
+                time.sleep(2)
+        print(f"\n{'='*60}")
+        print(f"[DONE] Processed {len(topics)} topics, {total_ingested} successful.")
+        print(f"{'='*60}")

@@ -108,7 +108,7 @@ def _process_payload(payload: str):
                 status = "failed"
         else:
             # 2. Fallback to search pipeline
-            result_msg = unified_search_and_run(query, max_results=1)
+            result_msg = unified_search_and_run(query, max_results=5)
             print(f"[worker] ingestion returned: {str(result_msg)[:400]}", flush=True)
             
             if result_msg and result_msg.startswith("Success"):
